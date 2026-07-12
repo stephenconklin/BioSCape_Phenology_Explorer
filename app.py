@@ -301,7 +301,7 @@ _source_warning = (
 _sidebar_content = [
     # Product label + font-size controls (top-right)
     html.Div([
-        html.Div("BioSCape · ESA / NASA", style={
+        html.Div("BioSCape · NASA", style={
             "fontFamily": "'Space Mono', monospace",
             "fontSize": "9px",
             "letterSpacing": "0.12em",
@@ -327,7 +327,7 @@ _sidebar_content = [
     }),
     html.Div(
         [
-            "Stephen Conklin · ",
+            # "Stephen Conklin · ",
             html.A(
                 "GitHub",
                 href="https://github.com/stephenconklin/VI_Phenology_Plotly_Cloud_Dashboard",
