@@ -441,6 +441,14 @@ def main() -> None:
 
     config = dict(PIXEL_METRIC_CONFIG)
     config["min_valid_obs"] = args.min_obs
+    if args.vi not in VI_VALID_RANGE:
+        print(
+            f"Error: no valid range configured for VI {args.vi!r}. "
+            f"Known VIs: {', '.join(VI_VALID_RANGE)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    config["vi_min"], config["vi_max"] = VI_VALID_RANGE[args.vi]
 
     try:
         all_regions = discover_regions()
