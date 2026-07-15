@@ -65,7 +65,12 @@ All settings live in [`config.py`](config.py). Common overrides via environment 
 | `VI_DATACUBE_ROOT` | Data root — local path or `gs://` URI | `gs://bioscape_phenology_data/` |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON content of a GCP service account key (for private buckets) | — |
 | `GCS_TOKEN` | Auth method: `anon` or `google_default` | `google_default` |
-| `SHAPEFILE_PATHS` | Space-separated paths to GeoJSON overlay files | LVIS flight boxes |
+
+Map overlays are configured directly in [`config.py`](config.py) via the
+`SHAPEFILE_LAYERS` list — one tuple per overlay: `(filename in shapefiles/,
+display label, selectable, visible-by-default)`. `selectable=False` renders the
+layer non-interactive so clicks pass through to the flight boxes beneath it
+(used for the HLS tile grid).
 
 ### Running Locally
 
@@ -97,12 +102,14 @@ modules/
   visualization.py            # Map helpers, tile services, shapefile loading, chart rendering
   phenology_metrics.py        # Whittaker smoothing and phenological metric computation
 shapefiles/
-  LVIS_Flightboxes.geojson    # BioSCape LVIS flight box polygons
-  BioSCape_HLS_Tiles.geojson  # HLS tile boundaries (optional overlay)
+  LVIS_Flightboxes_densified.geojson  # LVIS flight box polygons (densified edges — used by the app)
+  LVIS_Flightboxes.geojson            # Original flight box polygons (corner vertices only)
+  BioSCape_HLS_Tiles.geojson          # HLS tile boundaries (optional overlay)
 tools/
   convert_to_zarr.py          # Rechunk NetCDF → Zarr for faster GCS pixel reads
   pixel_phenology_extract.py  # Batch-compute per-pixel phenology metrics
   cache_basemaps.py           # Pre-render basemap cache files (.npz)
+  densify_flightboxes.py      # Densify flight box edges so they follow the curved UTM→WGS84 path
 ```
 
 ---
