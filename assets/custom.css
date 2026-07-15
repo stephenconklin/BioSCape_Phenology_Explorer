@@ -471,6 +471,23 @@ input.slider-tooltip,
 
 /* ── Leaflet map elements ────────────────────────────────── */
 .leaflet-container { background: #07111c !important; }
+
+/* Every click on the map now resolves to something — a valid pixel or the
+ * "No data at this location" toast — so the idle cursor should read as
+ * clickable everywhere, not just over the interactive flight-box polygons.
+ * Leaflet's own pan-drag handler puts a "leaflet-grab" (open hand) cursor
+ * on the container at rest; override it to a pointer, but let the
+ * "leaflet-dragging" state it adds during an active pan still show the
+ * grabbing-hand so panning still reads as panning. */
+.leaflet-container.leaflet-grab,
+.leaflet-grab .leaflet-interactive {
+  cursor: pointer !important;
+}
+.leaflet-dragging.leaflet-grab,
+.leaflet-dragging .leaflet-grab,
+.leaflet-dragging.leaflet-grab .leaflet-interactive {
+  cursor: grabbing !important;
+}
 .leaflet-control-zoom a {
   background: var(--bg-card) !important;
   border-color: var(--border) !important;
@@ -524,4 +541,16 @@ input.slider-tooltip,
 .font-size-btn:disabled {
   opacity: 0.25 !important;
   cursor: default;
+}
+
+/* ── Non-interactive shapefile overlay pane ─────────────────
+ * dash-leaflet 1.1.3 doesn't forward dl.GeoJSON's interactive=False prop
+ * to the underlying Leaflet layer, so paths in this pane still get
+ * Leaflet's own ".leaflet-interactive" class, which ships a built-in
+ * "pointer-events: auto" rule that overrides an inherited
+ * pointer-events:none from the pane's own style. This rule wins because
+ * it targets the path itself (not inherited), regardless of stylesheet
+ * load order. See app.py's _initial_map_children() for the pane setup. */
+.leaflet-shapefile-noninteractive-pane path {
+  pointer-events: none !important;
 }

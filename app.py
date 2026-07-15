@@ -33,10 +33,12 @@ _os.environ.setdefault("GRPC_POLL_STRATEGY", "epoll1")
 
 import base64
 import math
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from shapely.geometry import Point, shape
 from dash import (
     Dash, Input, Output, State,
     callback, ctx, dcc, html, no_update,
@@ -59,8 +61,10 @@ from config import (
     METRIC_LABELS,
     PIXEL_METRIC_CONFIG,
     NONNEGATIVE_METRICS,
-    SHAPEFILE_LABEL_FIELDS,
+    SHAPEFILE_INTERACTIVE,
+    SHAPEFILE_LABELS,
     SHAPEFILE_PATHS,
+    SHAPEFILE_VISIBLE_DEFAULT,
     VI_VALID_RANGE,
 )
 from modules.datacube_io import (
@@ -70,6 +74,7 @@ from modules.datacube_io import (
     build_date_cache,
     build_date_cache_from_dates,
     click_to_array_index,
+    find_nearest_display_cell,
     compute_basemap_metric,
     detect_crs_epsg,
     discover_regions,
@@ -77,7 +82,6 @@ from modules.datacube_io import (
     get_dataset,
     load_basemap_cache,
     load_metrics_for_basemap,
-    utm_to_latlon,
 )
 from modules.phenology_metrics import (
     compute_pixel_with_annual,
@@ -147,13 +151,40 @@ _DEFAULT_BASEMAP_KEY: str = FAST_BASEMAP_METRICS["Mean VI"]
 # Shapefile overlay list (static — not reactive)
 _SHAPEFILE_LIST: list[str] = SHAPEFILE_PATHS.split() if SHAPEFILE_PATHS else []
 _SHAPEFILE_OPTIONS = [
-    {"label": Path(p).stem, "value": str(i)}
+    {
+        "label": SHAPEFILE_LABELS[i] if i < len(SHAPEFILE_LABELS) else Path(p).stem,
+        "value": str(i),
+    }
     for i, p in enumerate(_SHAPEFILE_LIST)
+]
+# Checklist values (indices as strings) checked by default on page load
+_SHAPEFILE_VISIBLE_DEFAULT: list[str] = [
+    str(i)
+    for i in range(len(_SHAPEFILE_LIST))
+    if i >= len(SHAPEFILE_VISIBLE_DEFAULT) or SHAPEFILE_VISIBLE_DEFAULT[i]
 ]
 # Load shapefile GeoJSON at startup (avoids per-request file I/O)
 _SHAPEFILE_GEOJSON: list[dict | None] = [
     get_shapefile_geojson_data(p) for p in _SHAPEFILE_LIST
 ]
+
+# box_nr -> shapely geometry, built once at startup from the selectable
+# (interactive) shapefile layers. Flight boxes commonly overlap at their
+# edges (e.g. G5_10 and G5_18); a click in an overlap zone always resolves
+# to whichever polygon Leaflet's hit-test happens to report, which can
+# silently switch the active region out from under a pixel-selection click.
+# on_shapefile_click() uses this to check the CURRENT region's own polygon
+# first and stay put if the click is still inside it, rather than trusting
+# whichever box_nr Leaflet reported.
+_REGION_GEOMETRY: dict[str, object] = {}
+for _i, _gj in enumerate(_SHAPEFILE_GEOJSON):
+    if _gj is None or not (_i < len(SHAPEFILE_INTERACTIVE) and SHAPEFILE_INTERACTIVE[_i]):
+        continue
+    for _feat in _gj.get("features", []):
+        _box_nr = (_feat.get("properties") or {}).get("box_nr")
+        _geom = _feat.get("geometry")
+        if _box_nr and _geom:
+            _REGION_GEOMETRY[_box_nr] = shape(_geom)
 
 
 def _flatten_geojson_coords(geom: dict) -> list[tuple[float, float]]:
@@ -257,10 +288,29 @@ def _initial_map_children() -> list:
             opacity=0,
         ),
         dl.ScaleControl(position="bottomleft", imperial=False),
+        # Non-selectable shapefile layers (e.g. HLS tile grid) render in this
+        # pane instead of the default overlayPane. dash-leaflet 1.1.3 does not
+        # forward dl.GeoJSON's interactive=False prop to the underlying
+        # Leaflet layer, so every path still gets Leaflet's own
+        # ".leaflet-interactive" class, which carries a built-in
+        # "pointer-events: auto" rule (leaflet.css) that overrides an
+        # inherited pointer-events:none from this pane's own style — CSS only
+        # inherits when a descendant has no matching explicit rule of its
+        # own. The real fix is the "pane path { pointer-events: none !important; }"
+        # override in assets/custom.css targeting this pane's generated
+        # class ("leaflet-shapefile-noninteractive-pane"), which wins over
+        # Leaflet's rule regardless of load order.
+        dl.Pane(
+            name="shapefile-noninteractive",
+            style={"zIndex": 450, "pointerEvents": "none"},
+        ),
     ]
     # Static shapefile layers — visibility toggled by callback, not re-created
     for i, gj_data in enumerate(_SHAPEFILE_GEOJSON):
         if gj_data is not None:
+            interactive = (
+                SHAPEFILE_INTERACTIVE[i] if i < len(SHAPEFILE_INTERACTIVE) else True
+            )
             children.append(
                 dl.GeoJSON(
                     id=f"shapefile-layer-{i}",
@@ -270,8 +320,10 @@ def _initial_map_children() -> list:
                         "weight": 2,
                         "fillOpacity": 0.0,
                     },
-                    hoverStyle={"color": "#ffff00", "weight": 3},
+                    hoverStyle={"color": "#ffff00", "weight": 3} if interactive else {},
                     zoomToBoundsOnClick=False,
+                    interactive=interactive,
+                    pane=None if interactive else "shapefile-noninteractive",
                 )
             )
     return children
@@ -402,7 +454,7 @@ _sidebar_content = [
         dcc.Checklist(
             id="shapefile-visible",
             options=_SHAPEFILE_OPTIONS,
-            value=[o["value"] for o in _SHAPEFILE_OPTIONS],
+            value=_SHAPEFILE_VISIBLE_DEFAULT,
             labelStyle={"display": "block"},
         ),
     ]) if _SHAPEFILE_OPTIONS else html.Div(id="shapefile-visible")),
@@ -699,6 +751,60 @@ def update_year_slider(dataset_info: dict):
 # Callbacks: basemap / map state
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=16)
+def _resolve_basemap_array(region: str, metric: str):
+    """
+    Load the (z, lon, lat) display array for a region/metric — the exact
+    same array update_basemap() renders as the map overlay (precomputed
+    metrics file → disk cache → live Dask compute, in that priority order).
+
+    lru_cache avoids re-reading the (now multi-MB, at higher resolution)
+    basemap array from disk on every single pixel click — update_selected_
+    pixel() calls this too, so without caching, every click paid the full
+    disk-read cost again on top of update_basemap() already having just
+    loaded the identical array to render the overlay. Safe to cache: none
+    of the returned arrays are mutated in place by any caller (the
+    data_coverage NaN-fill below already copies before mutating).
+
+    Shared by update_basemap() (rendering) and update_selected_pixel()
+    (click resolution) so a click always resolves against the literal grid
+    the user is looking at, rather than an independently-derived native
+    UTM lookup that can disagree with the display near swath edges (two
+    different, non-pixel-aligned coordinate systems — see click_to_array_index
+    docstring).
+    """
+    paths = ALL_REGIONS[region]
+    z = lon = lat = None
+
+    if paths.metrics_path is not None and metric in ALL_19_METRICS:
+        try:
+            z, lon, lat = load_metrics_for_basemap(paths.metrics_path, metric)
+        except Exception:
+            pass
+
+    if z is None:
+        effective_metric = metric if metric in _FAST_METRIC_KEYS else "peak_ndvi_mean"
+        data_path        = paths.zarr_path or paths.nc_path
+        hit = load_basemap_cache(
+            basemap_cache_path(data_path, effective_metric, BASEMAP_MAX_DIM_PRECOMPUTED)
+        )
+        if hit is None:
+            hit = load_basemap_cache(
+                basemap_cache_path(data_path, effective_metric, BASEMAP_MAX_DIM)
+            )
+        if hit is None:
+            ds          = get_dataset(paths)
+            z, lon, lat = compute_basemap_metric(ds, effective_metric, vi_var=paths.vi_var)
+        else:
+            z, lon, lat = hit
+
+    if metric == "data_coverage":
+        z = z.copy()
+        z[z == 0.0] = np.nan
+
+    return z, lon, lat
+
+
 @callback(
     Output("metric-overlay", "url"),
     Output("metric-overlay", "bounds"),
@@ -721,38 +827,7 @@ def update_basemap(region, metric, basemap_style, opacity, colorscale_range):
 
     metric = metric or _DEFAULT_BASEMAP_KEY
     paths  = ALL_REGIONS[region]
-
-    # --- Load basemap array (fast-path: precomputed → disk cache → Dask) ---
-    z = lon = lat = None
-
-    if paths.metrics_path is not None and metric in ALL_19_METRICS:
-        try:
-            z, lon, lat = load_metrics_for_basemap(paths.metrics_path, metric)
-        except Exception:
-            pass
-
-    if z is None:
-        effective_metric = metric if metric in _FAST_METRIC_KEYS else "peak_ndvi_mean"
-        data_path        = paths.zarr_path or paths.nc_path
-        # Try pre-computed _d2000.npz first (generated offline, high-res),
-        # then fall back to the on-the-fly _d500.npz cache.
-        hit = load_basemap_cache(
-            basemap_cache_path(data_path, effective_metric, BASEMAP_MAX_DIM_PRECOMPUTED)
-        )
-        if hit is None:
-            hit = load_basemap_cache(
-                basemap_cache_path(data_path, effective_metric, BASEMAP_MAX_DIM)
-            )
-        if hit is None:
-            ds          = get_dataset(paths)
-            z, lon, lat = compute_basemap_metric(ds, effective_metric, vi_var=paths.vi_var)
-        else:
-            z, lon, lat = hit
-
-    # Zero data-coverage pixels are outside the datacube extent and should be
-    # transparent, not rendered as the low end of the colorscale.
-    if metric == "data_coverage":
-        z[z == 0.0] = np.nan
+    z, lon, lat = _resolve_basemap_array(region, metric)
 
     # --- Colorscale limits ---
     zmin, zmax = _compute_colorscale_limits(z, colorscale_range or "3sd", metric)
@@ -815,10 +890,14 @@ def update_basemap(region, metric, basemap_style, opacity, colorscale_range):
 # Callbacks: pixel selection
 # ---------------------------------------------------------------------------
 
+_NO_DATA_MSG = "No data at this location."
+
 @callback(
     Output("selected-pixel", "data"),
     Output("pixel-marker", "position"),
     Output("pixel-marker", "opacity"),
+    Output("no-data-toast", "is_open", allow_duplicate=True),
+    Output("no-data-toast", "children", allow_duplicate=True),
     Input("main-map", "clickData"),
     Input("region-dropdown", "value"),
     State("basemap-info", "data"),
@@ -827,7 +906,7 @@ def update_basemap(region, metric, basemap_style, opacity, colorscale_range):
 def update_selected_pixel(clickData, region, basemap_info):
     # Reset marker when region changes
     if ctx.triggered_id == "region-dropdown":
-        return None, [0, 0], 0
+        return None, [0, 0], 0, False, no_update
 
     if clickData is None or basemap_info is None:
         raise PreventUpdate
@@ -836,25 +915,76 @@ def update_selected_pixel(clickData, region, basemap_info):
     click_lat = float(latlng.get("lat", 0))
     click_lon = float(latlng.get("lng", 0))
 
-    # Ignore clicks outside the current datacube extent
+    # A click outside the current datacube's rectangular extent can't be
+    # resolved to any grid cell — still acknowledge it (dim marker at the
+    # click point + toast) rather than doing nothing, so the user gets
+    # feedback instead of wondering if the click registered at all.
     if not (
         basemap_info["lon_min"] <= click_lon <= basemap_info["lon_max"]
         and basemap_info["lat_min"] <= click_lat <= basemap_info["lat_max"]
     ):
-        raise PreventUpdate
+        return (
+            {"no_data": True, "lat": click_lat, "lon": click_lon},
+            [click_lat, click_lon], 0.5, True, _NO_DATA_MSG,
+        )
 
-    paths  = ALL_REGIONS[region]
-    ds     = get_dataset(paths)
-    yi, xi = click_to_array_index(click_lon, click_lat, ds)
+    paths = ALL_REGIONS[region]
+    ds    = get_dataset(paths)
 
+    # Resolve against the exact grid currently displayed, not an
+    # independently-derived native UTM lookup — the two are different,
+    # non-pixel-aligned coordinate systems (native UTM vs. the Mercator
+    # regrid used for the overlay) and can disagree by a pixel or more near
+    # swath edges. Find the displayed cell nearest the click first, then
+    # trace *that* cell back to its source native pixel, so the extracted
+    # data always matches the color the user actually clicked on.
+    z, lon_grid, lat_grid = _resolve_basemap_array(region, basemap_info["metric_key"])
+    src_epsg = detect_crs_epsg(ds)
+    iy, ix = find_nearest_display_cell(click_lon, click_lat, lon_grid, lat_grid)
+    cell_lon = float(lon_grid[iy, ix])
+    cell_lat = float(lat_grid[iy, ix])
+
+    if np.isnan(z[iy, ix]):
+        # The clicked cell is transparent in the current display — treat as
+        # no data, matching what's visually shown, rather than silently
+        # falling back to a nearby-but-different valid pixel.
+        return (
+            {"no_data": True, "lat": cell_lat, "lon": cell_lon},
+            [cell_lat, cell_lon], 0.5, True, _NO_DATA_MSG,
+        )
+
+    # The display-NaN check above is the real gate for "is there data here?".
+    # This call only maps the already-validated display cell back to its
+    # source native pixel index, so disable click_to_array_index's own
+    # distance guard (max_snap_distance_m=inf): we pass the cell's *own*
+    # center, which by construction is <1 native pixel from a real pixel, and
+    # we never want a Mercator-vs-UTM rounding difference near a swath edge to
+    # wrongly reject a cell the user can plainly see has color.
+    resolved = click_to_array_index(
+        cell_lon, cell_lat, ds, src_epsg=src_epsg,
+        max_snap_distance_m=float("inf"),
+    )
+    if resolved is None:
+        return (
+            {"no_data": True, "lat": cell_lat, "lon": cell_lon},
+            [cell_lat, cell_lon], 0.5, True, _NO_DATA_MSG,
+        )
+    yi, xi = resolved
+
+    # Report the DISPLAY cell's own coordinate, not the native pixel's
+    # reverse-transformed UTM center. The two differ slightly because the
+    # displayed grid is a separate Mercator regrid (see
+    # _regrid_to_mercator's docstring) — using the native center here would
+    # place the marker visibly off-center from the square it represents,
+    # even though it's the correct pixel for data extraction below.
     pixel_data = {
         "region": region,
         "yi":     int(yi),
         "xi":     int(xi),
-        "lon":    click_lon,
-        "lat":    click_lat,
+        "lon":    cell_lon,
+        "lat":    cell_lat,
     }
-    return pixel_data, [click_lat, click_lon], 1
+    return pixel_data, [cell_lat, cell_lon], 1, False, no_update
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +1003,7 @@ def compute_pixel_result(
     selected_pixel, year_range,
     basemap_info, lambda_val, region,
 ):
-    if selected_pixel is None or selected_pixel.get("region") != region:
+    if selected_pixel is None or selected_pixel.get("no_data") or selected_pixel.get("region") != region:
         return None
 
     paths = ALL_REGIONS.get(region)
@@ -1080,6 +1210,14 @@ def update_pixel_info(selected_pixel, pixel_result):
             style={"color": "rgba(255,255,255,0.28)", "fontSize": "0.82em", "fontStyle": "italic", "fontFamily": "'Space Mono', monospace", "letterSpacing": "0.06em"},
         )
 
+    if selected_pixel.get("no_data"):
+        return html.Div([
+            html.Div(_NO_DATA_MSG,
+                      style={"color": "#ff8a3d", "fontSize": "0.82em", "fontStyle": "italic", "fontFamily": "'Space Mono', monospace", "letterSpacing": "0.06em"}),
+            html.Div(f"{selected_pixel['lat']:.4f}°, {selected_pixel['lon']:.4f}°",
+                      style={"color": "rgba(255,255,255,0.28)", "fontSize": "0.75em", "fontFamily": "'Space Mono', monospace", "marginTop": "2px"}),
+        ])
+
     lon = selected_pixel["lon"]
     lat = selected_pixel["lat"]
     yi  = selected_pixel["yi"]
@@ -1168,8 +1306,8 @@ if _SHAPEFILE_LIST:
     @callback(
         Output("region-dropdown", "value"),
         Output("shapefile-region-locked", "data"),
-        Output("no-data-toast", "is_open"),
-        Output("no-data-toast", "children"),
+        Output("no-data-toast", "is_open", allow_duplicate=True),
+        Output("no-data-toast", "children", allow_duplicate=True),
         [Input(f"shapefile-layer-{i}", "clickData") for i in range(len(_SHAPEFILE_LIST))],
         State("shapefile-region-locked", "data"),
         State("region-dropdown", "value"),
@@ -1188,6 +1326,19 @@ if _SHAPEFILE_LIST:
         box_nr = (feature.get("properties") or {}).get("box_nr")
         if box_nr is None or box_nr == current_region:
             raise PreventUpdate
+
+        # Flight boxes commonly overlap at their edges. Leaflet's hit-test
+        # only reports ONE feature for a click in an overlap zone — often
+        # not the currently active region — which would otherwise silently
+        # switch regions out from under an ordinary pixel-selection click.
+        # If the click is still inside the current region's own polygon,
+        # stay put regardless of which box_nr Leaflet happened to report.
+        latlng = feature.get("latlng") or {}
+        current_geom = _REGION_GEOMETRY.get(current_region)
+        if current_geom is not None and "lat" in latlng and "lng" in latlng:
+            click_point = Point(latlng["lng"], latlng["lat"])
+            if current_geom.contains(click_point):
+                raise PreventUpdate
 
         if box_nr in ALL_REGIONS:
             return box_nr, no_update, False, ""

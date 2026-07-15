@@ -148,15 +148,26 @@ def get_overlay_url_and_bounds(
     """
     Compute the PNG data URI and bounds for a dash-leaflet ImageOverlay.
 
+    lat/lon give each cell's CENTER coordinate. Leaflet stretches the PNG to
+    exactly fill the given bounds, so using the raw center min/max here
+    would place the outermost pixel centers AT the image edges instead of
+    half a pixel inward — a systematic half-pixel compression of the
+    rendered raster relative to where the geographic grid says those pixels
+    actually are (grows more visible at higher resolution). Extend the
+    bounds by half a cell on each side so the true pixel-edge-to-pixel-edge
+    footprint is used instead of just the center-to-center span.
+
     Returns
     -------
     url    : base64-encoded RGBA PNG data URI
     bounds : [[lat_min, lon_min], [lat_max, lon_max]]
     """
     url = make_metric_overlay_png(z, lat, metric_key, zmin, zmax, opacity)
+    dlat = float(np.median(np.abs(np.diff(lat[:, 0])))) if lat.shape[0] > 1 else 0.0
+    dlon = float(np.median(np.abs(np.diff(lon[0, :])))) if lon.shape[1] > 1 else 0.0
     bounds = [
-        [float(lat.min()), float(lon.min())],
-        [float(lat.max()), float(lon.max())],
+        [float(lat.min()) - dlat / 2, float(lon.min()) - dlon / 2],
+        [float(lat.max()) + dlat / 2, float(lon.max()) + dlon / 2],
     ]
     return url, bounds
 

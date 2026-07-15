@@ -32,20 +32,30 @@ GCS_PROJECT: str | None = os.environ.get("BioSCape", None)
 # Shapefile overlays (optional — set to None to disable)
 # ---------------------------------------------------------------------------
 
-# Space-separated list of shapefile paths to display over the basemap.
-# Set to None to disable all overlays.
-# Example: "data/regions.shp data/plots.shp"
-# SHAPEFILE_PATHS: str | None = None
-# SHAPEFILE_PATHS: str = "/Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/LVIS_Flightboxes.geojson \
-#                         /Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/BioSCape_HLS_Tiles.geojson"
+# Each entry: (filename in shapefiles/, display label for the Overlay Layers
+# checklist, whether clicking a feature should select & zoom to that region,
+# whether the layer's checkbox starts checked/visible on page load).
+#
+# select=False renders the layer with interactive=False (Leaflet), so clicks
+# pass through to selectable layers underneath instead of being captured by
+# this one. This matters for large reference layers like the HLS tile grid —
+# without it, a full-coverage non-selectable layer silently swallows every
+# map click before it reaches the flight-box polygons beneath it.
 _PROJECT_ROOT = Path(__file__).parent
-SHAPEFILE_PATHS: str = str(_PROJECT_ROOT / "shapefiles" / "LVIS_Flightboxes.geojson")
+SHAPEFILE_LAYERS: list[tuple[str, str, bool, bool]] = [
+    ("LVIS_Flightboxes_densified.geojson", "LVIS Flight Boxes", True, True),
+    ("BioSCape_HLS_Tiles.geojson", "HLS Tile Grid", False, False),
+]
 
-# Space-separated list of attribute field names used as labels, one per file.
-# Must match the order of SHAPEFILE_PATHS.
-# Example: "NAME plot_id"
-# SHAPEFILE_LABEL_FIELDS: str = "box_nr Name"
-SHAPEFILE_LABEL_FIELDS: str = "box_nr"
+# Space-separated list of shapefile paths, built from SHAPEFILE_LAYERS above.
+# (app.py splits this on whitespace — see _SHAPEFILE_LIST.)
+SHAPEFILE_PATHS: str | None = (
+    " ".join(str(_PROJECT_ROOT / "shapefiles" / f) for f, _, _, _ in SHAPEFILE_LAYERS)
+    or None
+)
+SHAPEFILE_LABELS: list[str] = [label for _, label, _, _ in SHAPEFILE_LAYERS]
+SHAPEFILE_INTERACTIVE: list[bool] = [select for _, _, select, _ in SHAPEFILE_LAYERS]
+SHAPEFILE_VISIBLE_DEFAULT: list[bool] = [visible for _, _, _, visible in SHAPEFILE_LAYERS]
 
 # ---------------------------------------------------------------------------
 # Spatial / coordinate reference
@@ -89,10 +99,13 @@ LAMBDA_STEP: int = 10
 BASEMAP_MAX_DIM: int = 500
 
 # Maximum pixel count per axis for the precomputed pixel_metrics.nc path.
-# Data is already reduced to 2D so no Dask cost — use a higher limit to
-# display at or near native 30 m resolution for all current LVIS regions
-# (largest is G5_14 at 2 222 × 409 px).
-BASEMAP_MAX_DIM_PRECOMPUTED: int = 2000
+# Data is already reduced to 2D so no Dask cost — set above the largest
+# native dimension across all current LVIS regions (G5_2: 5329 x 359,
+# G5_7: 881 x 5334) plus headroom for _regrid_to_mercator's Mercator target
+# grid, which can be up to ~12% larger than the native array (rotation of
+# the UTM footprint relative to true north/east) — so no region gets
+# coarsened or has its target grid clipped below native ground resolution.
+BASEMAP_MAX_DIM_PRECOMPUTED: int = 6000
 
 # Fast basemap metrics always available (no precomputed file required).
 # Keys are the internal metric IDs used in compute_basemap_metric().

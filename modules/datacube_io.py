@@ -201,8 +201,24 @@ def discover_regions(root: str = DATACUBE_ROOT) -> dict[str, RegionPaths]:
     return _discover_regions_local(root)
 
 
+def _is_zarr_store(p: Path) -> bool:
+    """True if p is a directory ending in .zarr with a recognizable store marker."""
+    if not (p.is_dir() and p.name.endswith(".zarr")):
+        return False
+    return any((p / marker).exists() for marker in ("zarr.json", ".zmetadata", ".zgroup"))
+
+
 def _discover_regions_local(root: str) -> dict[str, RegionPaths]:
-    """Local filesystem implementation of region discovery."""
+    """
+    Local filesystem implementation of region discovery.
+
+    Discovers regions from Zarr stores (*.zarr/) and/or NetCDF datacubes
+    (*.nc, excluding pixel_metrics files).  Either is sufficient on its own —
+    a region with only a .nc file (not yet converted) is still discovered,
+    and a region with only a .zarr store (.nc no longer present) is too.
+    When both exist for the same stem, they're paired into one region and
+    get_dataset() prefers the Zarr copy for reads.
+    """
     root_path = Path(root)
     if not root_path.exists():
         raise FileNotFoundError(
@@ -210,39 +226,65 @@ def _discover_regions_local(root: str) -> dict[str, RegionPaths]:
             f"Set VI_DATACUBE_ROOT env var or edit config.py."
         )
 
-    nc_files = sorted(
+    zarr_paths = sorted(
+        (p for p in root_path.rglob("*.zarr") if _is_zarr_store(p)),
+        key=lambda p: _natural_sort_key(p.name),
+    )
+    nc_paths = sorted(
         (p for p in root_path.rglob("*.nc") if "pixel_metrics" not in p.stem),
         key=lambda p: _natural_sort_key(p.name),
     )
 
-    if not nc_files:
+    if not zarr_paths and not nc_paths:
         raise FileNotFoundError(
-            f"No *.nc datacube files found under: {root}\n"
+            f"No Zarr stores or *.nc datacube files found under: {root}\n"
             f"Set VI_DATACUBE_ROOT env var or edit config.py."
         )
 
-    # First pass: parse candidate region IDs and VI variable names
-    candidates: list[tuple[str, str, Path]] = []
-    for nc_path in nc_files:
+    # Build a lookup: (parent dir, stem) -> nc_path, for pairing with zarr stores
+    nc_by_key: dict[tuple[Path, str], Path] = {
+        (p.parent, p.stem): p for p in nc_paths
+    }
+
+    # Build candidate list from zarr stores first, then any unpaired nc files
+    # Each candidate: (region_id, vi_var, zarr_path_or_None, nc_path_or_None)
+    Candidate = tuple[str, str, Path | None, Path | None]
+    candidates: list[Candidate] = []
+    seen_keys: set[tuple[Path, str]] = set()
+
+    for zarr_path in zarr_paths:
+        stem = zarr_path.stem  # e.g. "NDVI_G5_1_datacube"
+        region_id, vi_var = _parse_nc_stem(stem)
+        key = (zarr_path.parent, stem)
+        nc_path = nc_by_key.get(key)
+        candidates.append((region_id, vi_var, zarr_path, nc_path))
+        seen_keys.add(key)
+
+    for nc_path in nc_paths:
+        key = (nc_path.parent, nc_path.stem)
+        if key in seen_keys:
+            continue  # already covered by the zarr entry above
         region_id, vi_var = _parse_nc_stem(nc_path.stem)
-        candidates.append((region_id, vi_var, nc_path))
+        candidates.append((region_id, vi_var, None, nc_path))
+        seen_keys.add(key)
 
     # Detect collisions and qualify with parent directory name
-    seen: dict[str, int] = {}
-    for rid, _, _ in candidates:
-        seen[rid] = seen.get(rid, 0) + 1
+    seen_ids: dict[str, int] = {}
+    for rid, _, _, _ in candidates:
+        seen_ids[rid] = seen_ids.get(rid, 0) + 1
 
     regions: dict[str, RegionPaths] = {}
-    for region_id, vi_var, nc_path in candidates:
-        if seen[region_id] > 1:
-            region_id = f"{nc_path.parent.name}/{region_id}"
+    for region_id, vi_var, zarr_path, nc_path in candidates:
+        src_path = zarr_path or nc_path
+        parent = src_path.parent
 
-        parent = nc_path.parent
-        zarr_path    = parent / (nc_path.stem + ".zarr")
+        if seen_ids[region_id] > 1:
+            region_id = f"{parent.name}/{region_id}"
+
         # pixel_phenology_extract.py writes NDVI_<region_id>_pixel_metrics.nc;
-        # fall back to <nc_stem>_pixel_metrics.nc for any alternative naming.
+        # fall back to <stem>_pixel_metrics.nc for any alternative naming.
         _metrics_canonical = parent / f"{vi_var}_{region_id}_pixel_metrics.nc"
-        _metrics_fallback  = parent / (nc_path.stem + "_pixel_metrics.nc")
+        _metrics_fallback  = parent / (src_path.stem + "_pixel_metrics.nc")
         metrics_path = (
             _metrics_canonical if _metrics_canonical.exists()
             else _metrics_fallback
@@ -250,8 +292,8 @@ def _discover_regions_local(root: str) -> dict[str, RegionPaths]:
 
         regions[region_id] = RegionPaths(
             region_id=region_id,
-            nc_path=str(nc_path),
-            zarr_path=str(zarr_path) if zarr_path.exists() else None,
+            nc_path=str(nc_path) if nc_path is not None else None,
+            zarr_path=str(zarr_path) if zarr_path is not None else None,
             metrics_path=str(metrics_path) if metrics_path.exists() else None,
             vi_var=vi_var,
         )
@@ -579,6 +621,7 @@ def _regrid_to_mercator(
     x_c: np.ndarray,
     y_c: np.ndarray,
     src_epsg: int,
+    max_dim: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Re-project z values from a regular UTM grid onto a regular Web Mercator
@@ -593,15 +636,25 @@ def _regrid_to_mercator(
     of UTM Zone 34S relative to geographic north, which causes 50–200 m pixel
     drift at flight-box edges.
 
-    Return value
-    ------------
-    z_reg     : reprojected metric values on the Mercator grid
-    lon_grid  : WGS84 longitude of each grid cell (for bounds calculation)
-    lat_grid  : WGS84 latitude  of each grid cell (for bounds calculation)
+    Target grid density
+    --------------------
+    The target grid must be at least as dense (in true ground distance) as
+    the native UTM pixel spacing, or narrow one-pixel-wide features (e.g. a
+    flight swath's edge fringe row) get skipped by the nearest-neighbour
+    resample and render as a false gap — while a click at that same location
+    still correctly resolves a valid native pixel via click_to_array_index()
+    (which queries the native grid directly, not this regrid). That
+    display/extraction mismatch is exactly what motivates sizing the target
+    grid here instead of reusing z.shape's native pixel COUNT, which doesn't
+    account for the axis-aligned Mercator bounding box being somewhat larger
+    in area than the source UTM bbox once rotated (typically ~2-12% for
+    these regions, not enough to worry about output size).
     """
     from scipy.interpolate import RegularGridInterpolator
 
     ny, nx = z.shape
+    if max_dim is None:
+        max_dim = max(ny, nx)
 
     # --- build interpolator on the UTM source grid ---
     # RegularGridInterpolator requires strictly increasing axis arrays;
@@ -630,9 +683,29 @@ def _regrid_to_mercator(
     merc_x_min, merc_x_max = float(np.min(cx)), float(np.max(cx))
     merc_y_min, merc_y_max = float(np.min(cy)), float(np.max(cy))
 
+    # --- size the target grid to match native ground resolution ---
+    # Web Mercator inflates real ground distance by 1/cos(lat) moving away
+    # from the equator, so a target spacing of native_size_m/cos(lat)
+    # Mercator-meters corresponds to native_size_m on the ground. Clamp to
+    # [nx, max_dim] so this never coarsens below the caller's original
+    # sizing (BASEMAP_MAX_DIM / BASEMAP_MAX_DIM_PRECOMPUTED) but also never
+    # exceeds the performance budget the caller already chose.
+    native_dx = float(np.median(np.abs(np.diff(x_c[x_order]))))
+    native_dy = float(np.median(np.abs(np.diff(y_c[y_order]))))
+    native_size_m = min(native_dx, native_dy) if native_dx and native_dy else 30.0
+    lat_mid = float(np.mean(lat_2d))
+    merc_per_native_pixel = native_size_m / max(np.cos(np.radians(lat_mid)), 1e-6)
+
+    target_nx = int(np.clip(
+        np.ceil((merc_x_max - merc_x_min) / merc_per_native_pixel), nx, max_dim
+    ))
+    target_ny = int(np.clip(
+        np.ceil((merc_y_max - merc_y_min) / merc_per_native_pixel), ny, max_dim
+    ))
+
     # --- regular Web Mercator target grid ---
-    merc_x = np.linspace(merc_x_min, merc_x_max, nx)
-    merc_y = np.linspace(merc_y_min, merc_y_max, ny)
+    merc_x = np.linspace(merc_x_min, merc_x_max, target_nx)
+    merc_y = np.linspace(merc_y_min, merc_y_max, target_ny)
     merc_x_grid, merc_y_grid = np.meshgrid(merc_x, merc_y)
 
     # --- Mercator → WGS84 (for the return value / ImageOverlay bounds) ---
@@ -640,8 +713,8 @@ def _regrid_to_mercator(
     lon_flat, lat_flat = tf_merc_to_wgs.transform(
         merc_x_grid.ravel(), merc_y_grid.ravel()
     )
-    lon_grid = lon_flat.reshape(ny, nx)
-    lat_grid = lat_flat.reshape(ny, nx)
+    lon_grid = lon_flat.reshape(target_ny, target_nx)
+    lat_grid = lat_flat.reshape(target_ny, target_nx)
 
     # --- Mercator → UTM (for interpolator lookup) ---
     tf_merc_to_utm = _get_transformer(3857, src_epsg)
@@ -650,7 +723,7 @@ def _regrid_to_mercator(
     )
     z_reg = interp(
         np.column_stack([y_tgt, x_tgt])  # interpolator axis order: (northing, easting)
-    ).reshape(ny, nx)
+    ).reshape(target_ny, target_nx)
 
     return z_reg, lon_grid, lat_grid
 
@@ -793,20 +866,25 @@ def compute_basemap_metric(
     lon_2d = lon_2d.reshape(yy.shape)
     lat_2d = lat_2d.reshape(yy.shape)
 
-    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
+    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg, max_dim=max_dim)
 
 
 def load_metrics_for_basemap(
     metrics_path: str,
     metric: str,
     max_dim: int = BASEMAP_MAX_DIM_PRECOMPUTED,
-    src_epsg: int = DATACUBE_CRS_EPSG,
+    src_epsg: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Fast path: load one 2-D metric slice from a precomputed pixel_metrics.nc.
     Returns (z_2d, lon_2d, lat_2d) at display resolution.
 
     Supports both local paths and GCS URIs.
+
+    src_epsg : if None (default), auto-detected from the file's own
+    'spatial_ref' variable via detect_crs_epsg() — mirrors
+    compute_basemap_metric()'s behavior so the precomputed-metrics path
+    can't drift out of sync with a region's true CRS.
     """
     open_kwargs: dict = {"mask_and_scale": True, "decode_timedelta": False}
     if _is_gcs(metrics_path):
@@ -819,6 +897,8 @@ def load_metrics_for_basemap(
                 f"Metric {metric!r} not found in {metrics_path}. "
                 f"Available: {list(ds_m.data_vars)}"
             )
+        if src_epsg is None:
+            src_epsg = detect_crs_epsg(ds_m)
         da = ds_m[metric]
         ny, nx = da.sizes["y"], da.sizes["x"]
         cf_y = max(1, ny // max_dim)
@@ -834,7 +914,7 @@ def load_metrics_for_basemap(
     lon_2d, lat_2d = utm_to_latlon(xx.ravel(), yy.ravel(), src_epsg)
     lon_2d = lon_2d.reshape(yy.shape)
     lat_2d = lat_2d.reshape(yy.shape)
-    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
+    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg, max_dim=max_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -1049,20 +1129,41 @@ def click_to_array_index(
     click_lat: float,
     ds: xr.Dataset,
     src_epsg: int | None = None,
-) -> tuple[int, int]:
+    max_snap_distance_m: float | None = None,
+) -> tuple[int, int] | None:
     """
     Convert a Plotly heatmap click's (lon, lat) display coordinates to
     zero-based (yi, xi) array indices via nearest-neighbour lookup.
+
+    Distance guard
+    ---------------
+    The datacube's (x, y) coordinate arrays span the full axis-aligned
+    rectangular bounding box of the region, which for a rotated/diagonal
+    flight swath is noticeably larger than the true footprint — the
+    rotation opens up empty corners inside the bounding box. Nearest-
+    neighbour lookup on x and y independently always returns *some* index,
+    even for a click deep in one of those empty corners, because it just
+    needs the closest row and closest column, not a check that the
+    resulting pixel is actually near the click. Left unguarded, this can
+    resolve a click many kilometers from any real data to a genuinely
+    valid (but unrelated) pixel elsewhere in the swath, since that pixel's
+    row/column happen to be nearest. max_snap_distance_m rejects the click
+    (returns None) when the resolved pixel is farther than one native
+    pixel width away, instead of silently returning unrelated data.
 
     Parameters
     ----------
     click_lon, click_lat : WGS84 coordinates from the Plotly click event
     ds                   : lazily opened xarray Dataset for the region
     src_epsg             : UTM EPSG of the datacube; auto-detected if None
+    max_snap_distance_m  : reject the click if the nearest pixel center is
+                            farther than this (meters). Defaults to the
+                            native grid spacing (one pixel width).
 
     Returns
     -------
-    (yi, xi) clamped to valid array bounds
+    (yi, xi) clamped to valid array bounds, or None if the click is farther
+    than max_snap_distance_m from the nearest native pixel.
     """
     if src_epsg is None:
         src_epsg = detect_crs_epsg(ds)
@@ -1078,4 +1179,62 @@ def click_to_array_index(
     xi = max(0, min(xi, len(x_vals) - 1))
     yi = max(0, min(yi, len(y_vals) - 1))
 
+    if max_snap_distance_m is None:
+        dx = float(np.median(np.abs(np.diff(np.sort(x_vals))))) if len(x_vals) > 1 else 30.0
+        dy = float(np.median(np.abs(np.diff(np.sort(y_vals))))) if len(y_vals) > 1 else 30.0
+        max_snap_distance_m = max(dx, dy)
+
+    dist = float(np.hypot(x_vals[xi] - x_click, y_vals[yi] - y_click))
+    if dist > max_snap_distance_m:
+        return None
+
     return yi, xi
+
+
+def find_nearest_display_cell(
+    click_lon: float,
+    click_lat: float,
+    lon_grid: np.ndarray,
+    lat_grid: np.ndarray,
+) -> tuple[int, int]:
+    """
+    Find the (iy, ix) cell in a displayed basemap's regridded lon/lat arrays
+    nearest to a click, by direct index computation on the grid's own
+    (regular, by construction) Web Mercator spacing.
+
+    Used together with click_to_array_index() to resolve a click against the
+    exact grid the user is looking at: call this first to find which display
+    cell was clicked, then pass that cell's OWN lon_grid/lat_grid value back
+    into click_to_array_index() to get the native pixel that cell's color
+    was actually sourced from. This guarantees the extracted pixel always
+    matches the displayed one — unlike converting the raw click straight to
+    a native UTM index, which can disagree with the display near swath
+    edges (see click_to_array_index docstring: two different, non-pixel-
+    aligned coordinate systems).
+
+    O(1), not O(n): lon_grid/lat_grid come from a regridding step onto a
+    REGULAR grid in Web Mercator space (see _regrid_to_mercator), so the
+    nearest cell's index can be computed directly from the click's Mercator
+    position and the grid's corner spacing, instead of transforming and
+    searching every cell — which got noticeably slow once display arrays
+    grew into the millions of cells at higher resolution.
+    """
+    ny, nx = lon_grid.shape
+    tf = _get_transformer(TARGET_CRS_EPSG, 3857)
+
+    mx_00, my_00 = tf.transform(float(lon_grid[0, 0]), float(lat_grid[0, 0]))
+    if nx > 1:
+        mx_0n, _ = tf.transform(float(lon_grid[0, -1]), float(lat_grid[0, -1]))
+    else:
+        mx_0n = mx_00
+    if ny > 1:
+        _, my_n0 = tf.transform(float(lon_grid[-1, 0]), float(lat_grid[-1, 0]))
+    else:
+        my_n0 = my_00
+    mx_click, my_click = tf.transform(click_lon, click_lat)
+
+    ix = int(round((mx_click - mx_00) / (mx_0n - mx_00) * (nx - 1))) if nx > 1 else 0
+    iy = int(round((my_click - my_00) / (my_n0 - my_00) * (ny - 1))) if ny > 1 else 0
+    ix = max(0, min(ix, nx - 1))
+    iy = max(0, min(iy, ny - 1))
+    return iy, ix
