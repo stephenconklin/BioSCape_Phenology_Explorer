@@ -515,6 +515,7 @@ _main_panel = dbc.Col(
                                   style={"height": "100%"},
                                   config={"responsive": True}),
                         label="Raw VI",
+                        tab_id="tab-raw-vi",
                     ),
                     dbc.Tab(
                         dcc.Graph(id="annual-cycle-chart",
@@ -522,6 +523,7 @@ _main_panel = dbc.Col(
                                   style={"height": "100%"},
                                   config={"responsive": True}),
                         label="Annual Cycles",
+                        tab_id="tab-annual-cycle",
                     ),
                     dbc.Tab(
                         html.Div(
@@ -531,6 +533,7 @@ _main_panel = dbc.Col(
                             id="metrics-annual-chart-wrapper",
                         ),
                         label="Metric Trends",
+                        tab_id="tab-metrics-annual",
                     ),
                     dbc.Tab(
                         dcc.Graph(id="phenology-scatter-chart",
@@ -538,8 +541,22 @@ _main_panel = dbc.Col(
                                   style={"height": "100%"},
                                   config={"responsive": True}),
                         label="Phenology Scatter",
+                        tab_id="tab-phenology-scatter",
                     ),
                 ],
+                # Explicit — don't rely on dbc.Tabs' implicit "select the first
+                # tab by default" behavior, which differs across dash-
+                # bootstrap-components versions (confirmed: 2.0.4, resolved by
+                # requirements.txt's open `>=1.5` range in a fresh Docker
+                # build, does NOT auto-select a tab, leaving active_tab=None
+                # and every tab-pane unmounted until the user manually clicks
+                # a tab — vs. an older 1.x install where a tab was already
+                # auto-selected. That explained the reported symptom exactly:
+                # no tab visibly highlighted on load, and the Raw VI chart
+                # not rendering until switching tabs mounted its tab-pane for
+                # the first time).
+                active_tab="tab-raw-vi",
+                id="charts-tabs",
             ),
             id="charts-wrapper",
         ),
