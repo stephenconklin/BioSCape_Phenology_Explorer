@@ -478,6 +478,7 @@ _sidebar_content = [
     dcc.Store(id="pixel-result"),
     dcc.Store(id="shapefile-region-locked"),   # region ID locked after shapefile click
     dcc.Store(id="font-scale-store", data=1.0),
+    html.Div(id="_resize-ping", style={"display": "none"}),
 ]
 
 _sidebar = dbc.Col(_sidebar_content, width=3, id="sidebar-col", style=_SIDEBAR_STYLE)
@@ -710,6 +711,28 @@ app.clientside_callback(
     "function(v) { return v || window.dash_clientside.no_update; }",
     Output("year-range", "value", allow_duplicate=True),
     Input("year-range", "drag_value"),
+    prevent_initial_call=True,
+)
+
+# Nudge Plotly to remeasure/redraw the chart tabs whenever fresh pixel data
+# lands. Plotly.react() (what dcc.Graph uses to apply a new `figure`) doesn't
+# force a container remeasure on its own — only an explicit window 'resize'
+# event does (config={"responsive": True} listens for it), which is exactly
+# what resize.js's own one-time post-load nudge relies on. Without this, the
+# very FIRST real figure drawn into a chart tab can render into a container
+# whose size hasn't been confirmed since page load, leaving it blank until
+# something else (e.g. switching tabs, which remounts the tab-pane) forces a
+# remeasure. Re-firing the same nudge on every pixel-result update covers the
+# case a tab switch happened to mask.
+app.clientside_callback(
+    """
+    function(_) {
+        setTimeout(function () { window.dispatchEvent(new Event('resize')); }, 50);
+        return '';
+    }
+    """,
+    Output("_resize-ping", "children"),
+    Input("pixel-result", "data"),
     prevent_initial_call=True,
 )
 
