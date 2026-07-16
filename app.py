@@ -714,25 +714,39 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
-# Nudge Plotly to remeasure/redraw the chart tabs whenever fresh pixel data
-# lands. Plotly.react() (what dcc.Graph uses to apply a new `figure`) doesn't
-# force a container remeasure on its own — only an explicit window 'resize'
-# event does (config={"responsive": True} listens for it), which is exactly
-# what resize.js's own one-time post-load nudge relies on. Without this, the
-# very FIRST real figure drawn into a chart tab can render into a container
-# whose size hasn't been confirmed since page load, leaving it blank until
-# something else (e.g. switching tabs, which remounts the tab-pane) forces a
-# remeasure. Re-firing the same nudge on every pixel-result update covers the
-# case a tab switch happened to mask.
+# Nudge Plotly to remeasure/redraw the chart tabs whenever a fresh figure is
+# actually applied to a Graph. Plotly.react() (what dcc.Graph uses to apply a
+# new `figure`) doesn't force a container remeasure on its own — only an
+# explicit window 'resize' event does (config={"responsive": True} listens for
+# it), which is exactly what resize.js's own one-time post-load nudge relies
+# on. Without this, the very FIRST real figure drawn into a chart tab can
+# render into a container whose size hasn't been confirmed since page load,
+# leaving it blank until something else (e.g. switching tabs, which remounts
+# the tab-pane) forces a remeasure.
+#
+# Keyed on the chart *figure* Outputs themselves, NOT on the "pixel-result"
+# Store — the four chart callbacks (render_timeseries etc.) are separate
+# server-side round-trips from compute_pixel_result, so a clientside callback
+# keyed on "pixel-result" fires as soon as THAT store lands, racing ahead of
+# the chart callbacks' own (independent, possibly much slower over a real
+# network) round-trips. On localhost the render_timeseries round-trip was
+# fast enough to coincidentally beat a short setTimeout, masking the race;
+# over the Jetstream deployment's real network latency the resize fired
+# before the actual figure had arrived, remeasuring a container that still
+# held the old/empty figure. Firing on the figure props themselves guarantees
+# the nudge happens only once Dash has actually applied the new figure.
 app.clientside_callback(
     """
-    function(_) {
+    function(f1, f2, f3, f4) {
         setTimeout(function () { window.dispatchEvent(new Event('resize')); }, 50);
         return '';
     }
     """,
     Output("_resize-ping", "children"),
-    Input("pixel-result", "data"),
+    Input("timeseries-chart", "figure"),
+    Input("annual-cycle-chart", "figure"),
+    Input("metrics-annual-chart", "figure"),
+    Input("phenology-scatter-chart", "figure"),
     prevent_initial_call=True,
 )
 
