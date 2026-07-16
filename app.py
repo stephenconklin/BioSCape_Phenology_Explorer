@@ -237,6 +237,7 @@ _FAST_METRIC_KEYS: frozenset[str] = frozenset(FAST_BASEMAP_METRICS.values())
 
 app = Dash(
     __name__,
+    title="BioSCape Phenology Explorer",
     external_stylesheets=[
         dbc.themes.BOOTSTRAP,
         "https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@300;400;500;600&display=swap",
