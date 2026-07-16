@@ -1,0 +1,20 @@
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data files — never in the repo, but excluded defensively
+*.nc
+*.zarr/
+*.zarr
+*.npz
+*.h5
+*.hdf5
+*.tif
+*.tiff
+
+*.log
+.DS_Store
+.pytest_cache/
+docs/

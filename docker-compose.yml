@@ -1,0 +1,11 @@
+services:
+  dashboard:
+    build: .
+    image: bioscape-phenology-explorer:latest
+    ports:
+      - "80:8050"
+    environment:
+      VI_DATACUBE_ROOT: /data
+    volumes:
+      - /media/volume/Bioscape_Dashboard_Data/BioSCape_SA_LVIS/VI_Phenology/netcdf_datacube:/data:ro
+    restart: unless-stopped

@@ -88,6 +88,41 @@ gunicorn app:server
 
 Set `GOOGLE_SERVICE_ACCOUNT_JSON` in your platform's environment variables with the full contents of a service account JSON key that has **Storage Object Viewer** access to the data bucket.
 
+### Docker Deployment (e.g. Jetstream2)
+
+A `Dockerfile` and `docker-compose.yml` are included for deploying to a plain VM
+with a locally-mounted data volume (no GCS credentials required). `docker-compose.yml`
+is checked in pre-configured for the project's Jetstream2 instance — edit the
+`volumes:` path if deploying elsewhere.
+
+```bash
+docker compose up -d --build
+```
+
+This builds the image, starts the container bound to host port 80 (mapped to
+gunicorn on 8050 inside the container), and mounts the data volume read-only at
+`/data` with `VI_DATACUBE_ROOT=/data` set automatically. `restart: unless-stopped`
+keeps it running across container crashes and VM reboots (as long as the Docker
+daemon itself starts on boot, which is the default on Ubuntu).
+
+Before starting, confirm the volume path in `docker-compose.yml` actually exists
+on the host and contains `<region>_<VI>_datacube.zarr` / `<region>_pixel_metrics.nc`
+files — the container will start regardless, but `discover_regions()` finds
+nothing and the region dropdown will be empty.
+
+**Firewall note:** exposing port 80 also requires the VM's cloud-provider
+security group (e.g. Jetstream2's OpenStack security group, configured via the
+Horizon dashboard or `openstack` CLI) to allow inbound TCP/80 — this is outside
+Docker's control and must be opened separately.
+
+Useful commands:
+
+```bash
+docker compose logs -f dashboard   # tail logs
+docker compose down                # stop
+docker compose up -d --build       # redeploy after a code change
+```
+
 ---
 
 ## Project Structure
@@ -97,6 +132,9 @@ app.py                        # Dash application — layout and callbacks
 config.py                     # Tuneable constants and environment variable overrides
 requirements.txt              # Python dependencies
 Procfile                      # Gunicorn entry point for cloud deployment
+Dockerfile                    # Container image build (gunicorn on port 8050)
+docker-compose.yml            # Docker Compose deployment (volume mount, port 80, restart policy)
+.dockerignore                 # Files excluded from the Docker build context
 modules/
   datacube_io.py              # Region discovery, dataset loading, pixel extraction
   visualization.py            # Map helpers, tile services, shapefile loading, chart rendering
