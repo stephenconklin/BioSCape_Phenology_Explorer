@@ -27,13 +27,13 @@ This dashboard is part of a broader phenology analysis workflow:
 - **Phenology charts**: raw VI time series, annual cycle composites, interannual metric trends, and phenology scatter plots
 - **Multiple basemap styles**: Satellite, Topographic, Shaded Relief, OpenStreetMap, or no basemap
 - **Lazy data loading** via Dask — full datacubes are never loaded into memory
-- **GCS-native** — reads Zarr stores directly from Google Cloud Storage
+- **Flexible data backend** — reads datacubes from a local filesystem path or directly from Google Cloud Storage (`gs://`) via Zarr/gcsfs; no GCS dependency for local deployments
 
 ---
 
 ## Data
 
-Data are hosted in the `bioscape_phenology_data` GCS bucket. Each region corresponds to a BioSCape LVIS flight box (e.g. `G5_8`) and is produced by the upstream HLS_VI_Pipeline and VI_Phenology pipelines.
+Each region corresponds to a BioSCape LVIS flight box (e.g. `G5_8`) and is produced by the upstream HLS_VI_Pipeline and VI_Phenology pipelines. Datacubes can live anywhere `DATACUBE_ROOT` points to — a local directory, a mounted volume, or a `gs://` bucket (the project's own deployment uses a locally-mounted data volume; a public read-only copy is also mirrored to the `bioscape_phenology_data` GCS bucket for convenience).
 
 | File | Description |
 |---|---|
@@ -62,9 +62,13 @@ All settings live in [`config.py`](config.py). Common overrides via environment 
 
 | Variable | Description | Default |
 |---|---|---|
-| `VI_DATACUBE_ROOT` | Data root — local path or `gs://` URI | `gs://bioscape_phenology_data/` |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON content of a GCP service account key (for private buckets) | — |
-| `GCS_TOKEN` | Auth method: `anon` or `google_default` | `google_default` |
+| `VI_DATACUBE_ROOT` | Data root — any local path or a `gs://` URI | `/media/volume/Bioscape_Dashboard_Data/phenology_data/LVIS_flightboxes` (this project's deployment volume) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON content of a GCP service account key (only used when `VI_DATACUBE_ROOT` is a `gs://` URI pointing at a private bucket) | — |
+| `GCS_TOKEN` | GCS auth method: `anon` or `google_default` (only relevant for `gs://` roots) | `google_default` |
+
+For a local deployment, just point `VI_DATACUBE_ROOT` at a directory containing
+`<region>_<VI>_datacube.zarr` / `<region>_pixel_metrics.nc` files — no GCS
+credentials, buckets, or extra setup required.
 
 Map overlays are configured directly in [`config.py`](config.py) via the
 `SHAPEFILE_LAYERS` list — one tuple per overlay: `(filename in shapefiles/,
@@ -86,7 +90,7 @@ App available at `http://localhost:8050`.
 gunicorn app:server
 ```
 
-Set `GOOGLE_SERVICE_ACCOUNT_JSON` in your platform's environment variables with the full contents of a service account JSON key that has **Storage Object Viewer** access to the data bucket.
+If `VI_DATACUBE_ROOT` points at a private GCS bucket, set `GOOGLE_SERVICE_ACCOUNT_JSON` in your platform's environment variables with the full contents of a service account JSON key that has **Storage Object Viewer** access to the bucket. If it points at a local path or mounted volume (e.g. the Docker deployment below), no GCS credentials are needed.
 
 ### Docker Deployment (e.g. Jetstream2)
 
