@@ -806,7 +806,7 @@ def update_year_slider(dataset_info: dict):
 # Callbacks: basemap / map state
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=6)
 def _resolve_basemap_array(region: str, metric: str):
     """
     Load the (z, lon, lat) display array for a region/metric — the exact
@@ -820,6 +820,11 @@ def _resolve_basemap_array(region: str, metric: str):
     loaded the identical array to render the overlay. Safe to cache: none
     of the returned arrays are mutated in place by any caller (the
     data_coverage NaN-fill below already copies before mutating).
+
+    maxsize=6 (not larger) — the deployment target is a 6GB-RAM instance
+    running multiple gunicorn workers, each with its own copy of this
+    cache; each entry can be tens to ~100MB (three full-resolution arrays),
+    so an unbounded or large cache risks OOM under multi-region browsing.
 
     Shared by update_basemap() (rendering) and update_selected_pixel()
     (click resolution) so a click always resolves against the literal grid

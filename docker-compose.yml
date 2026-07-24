@@ -9,3 +9,9 @@ services:
     volumes:
       - /media/volume/Bioscape_Dashboard_Data/phenology_data:/data:ro
     restart: unless-stopped
+    mem_limit: 5g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

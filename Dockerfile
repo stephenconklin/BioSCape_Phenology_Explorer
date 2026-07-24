@@ -18,6 +18,9 @@ EXPOSE 8050
 CMD ["gunicorn", "app:server", \
      "--bind", "0.0.0.0:8050", \
      "--workers", "2", \
+     "--worker-class", "gthread", \
      "--threads", "2", \
      "--timeout", "120", \
-     "--preload"]
+     "--preload", \
+     "--max-requests", "300", \
+     "--max-requests-jitter", "30"]
