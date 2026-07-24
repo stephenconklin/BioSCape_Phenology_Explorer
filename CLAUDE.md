@@ -136,6 +136,34 @@ cb.outline.set_edgecolor((0.357, 0.890, 1.0, 0.3))  # correct
 cb.outline.set_edgecolor("rgba(91,227,255,0.3)")      # ValueError
 ```
 
+## Deployment (Jetstream2, Docker)
+
+Production runs as a Docker container on a Jetstream2 `m3.small` instance:
+**2 CPU cores, 6GB RAM, 20GB root disk, 30GB attached volume** (mounted at
+`/media/volume/Bioscape_Dashboard_Data/phenology_data`, bind-mounted read-only
+into the container at `/data` via `docker-compose.yml`). `Dockerfile`'s `CMD`
+is what actually runs in production — `Procfile` is a separate, unrelated
+entry point for a Dash Enterprise deployment target and is not used here.
+
+A full memory-leak / hang investigation (2026-07) found **no active leaks**
+(matplotlib figures, xarray/Dask handles, and all module-level caches are
+either `with`-scoped or bounded `lru_cache`s — see `datacube_io.py` docstrings).
+The changes below are pre-emptive tuning for the tight 6GB/2-core budget, not
+leak fixes:
+
+| Constraint | Change | Why |
+|---|---|---|
+| 2 CPU cores, single-threaded default | `Dockerfile` CMD: `--workers 2 --worker-class gthread --threads 2 --preload` | Gunicorn's default `sync` worker class **silently ignores `--threads`** — `--worker-class gthread` is required for threading to have any effect at all. `--preload` shares the pre-fork import footprint (numpy/xarray/dask/matplotlib, ~200-400MB) across workers via copy-on-write instead of duplicating it. |
+| 6GB RAM, no defensive recycling | `--max-requests 300 --max-requests-jitter 30` | Safety net against any future slow memory drift, even though none was found. |
+| No container memory cap | `docker-compose.yml`: `mem_limit: 5g` | Leaves ~1GB headroom for host OS/SSH. Without a cap, an OOM event lets the *host* kernel pick the kill victim (could be sshd, not the container). |
+| Unbounded Docker logs on a 20GB root disk | `docker-compose.yml`: `logging.options.max-size: 10m, max-file: 3` | Default `json-file` driver has no size limit; over months of uptime this can silently fill the root disk, which then breaks temp files / restarts and looks like "the app hung." |
+| `_resolve_basemap_array` cache (`app.py`) sized for a bigger box | `lru_cache(maxsize=16)` → `maxsize=6` | Each entry (z/lon/lat display arrays) is tens to ~100MB; each of the 2 gunicorn workers holds its own copy, so 16 entries × 2 workers risked real memory pressure on 6GB. |
+
+**Not yet done** (host-level, outside the repo — do if RAM pressure shows up):
+add a ~2GB swapfile on the host (`fallocate` + `mkswap` + `swapon` + `/etc/fstab`
+entry) as an OOM safety net; Docker containers get access to host swap by
+default unless `--memory-swap` is explicitly capped, which it isn't here.
+
 ## Config Reference
 
 ```python
