@@ -302,6 +302,11 @@ on a box that has already been bitten once by dependency drift.
 That fixes the actual exposure problem and leaves every existing safeguard
 (memory cap, log caps, read-only mount, healthcheck, autoheal) intact.
 
+Fully written up as a phased, reversible runbook in
+[`docs/nginx-deployment-plan.md`](docs/nginx-deployment-plan.md) — including a
+decision gate keyed to health-sampler findings, and the case where the sampler
+*disproves* the starvation diagnosis. Not yet executed as of 2026-07-30.
+
 ### Housekeeping that is genuinely load-bearing
 
 The 20GB root disk hit 90% during this investigation. A full root breaks temp
