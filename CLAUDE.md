@@ -274,6 +274,34 @@ client / scanner starvation. Threads in `netCDF4`/HDF5 or dask → serialized
 data reads. Different causes, different fixes. Keep a healthy-state baseline
 dump for comparison.
 
+### If the hang recurs after the nginx cutover
+
+nginx now records what gunicorn structurally could not — a starved `gthread`
+worker logs nothing at all, because it heartbeats from its poller loop.
+
+```bash
+# Upstream failures: the app tier, not the connection tier
+sudo grep -E 'upstream (timed out|prematurely closed)' /var/log/nginx/phenology.error.log | tail
+
+# Traffic nginx rejected before it reached Python
+sudo grep -c 'limiting requests' /var/log/nginx/phenology.error.log
+
+# Slowest requests — last field is upstream response time
+sudo awk '{print $NF}' /var/log/nginx/phenology.access.log | sort -rn | head
+```
+
+`upstream timed out` entries mean requests are reaching gunicorn and dying
+there, which points at the serialized `netCDF4`/HDF5 reads rather than at
+connection handling — a different fix (more workers, or a threadsafe read
+path). Their **absence** during a recurrence means the problem is upstream of
+the app entirely.
+
+One caveat on the diagnosis: the *failure mode* (alive, idle, not serving) is
+confirmed. The *cause* — scanner traffic consuming all four slots — remains an
+inference. It is well-supported (the traffic is in the logs, the arithmetic
+works) but no connection census was captured mid-hang. If hangs recur, revisit
+that assumption before anything else.
+
 ## Future deployment strategy
 
 ### Put nginx in front — unambiguously correct
@@ -330,10 +358,19 @@ on a box that has already been bitten once by dependency drift.
 That fixes the actual exposure problem and leaves every existing safeguard
 (memory cap, log caps, read-only mount, healthcheck, autoheal) intact.
 
-Fully written up as a phased, reversible runbook in
-[`docs/nginx-deployment-plan.md`](docs/nginx-deployment-plan.md) — including a
-decision gate keyed to health-sampler findings, and the case where the sampler
-*disproves* the starvation diagnosis. Not yet executed as of 2026-07-30.
+**Executed 2026-07-30** via `deploy/bootstrap.sh` (adoption path — `APP_DIR`
+pointed at the existing checkout, container recreated on loopback, nginx
+installed in front). Verified with:
+
+```
+$ sudo ss -tlnp | grep -E ':80|:8050'
+0.0.0.0:80     nginx           ← only public listener
+127.0.0.1:8050 docker-proxy    ← loopback only
+```
+
+Provisioning now lives in [`deploy/`](deploy/) — see
+[`deploy/README.md`](deploy/README.md), which covers fresh installs, adopting
+an existing host, and a near-zero-downtime cutover variant.
 
 ### Housekeeping that is genuinely load-bearing
 

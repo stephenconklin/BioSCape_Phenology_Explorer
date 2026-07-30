@@ -77,10 +77,37 @@ Two prerequisites:
 `docker compose --project-directory <APP_DIR> up -d`, then
 `sudo systemctl stop nginx`.
 
-If you would rather migrate in reversible stages with a validation gate at
-each step — staging nginx on port 8080 and testing it before touching port 80
-— use `docs/nginx-deployment-plan.md` instead. That plan exists specifically
-for the running production instance; this script is the greenfield path.
+### Near-zero-downtime variant
+
+If an adoption cannot afford the 2-4 minute gap, stage nginx on a spare port
+and validate it fully before port 80 moves. Docker allows several published
+ports for one container port, so the loopback binding can be added *before*
+the public one is removed:
+
+1. In `<APP_DIR>/.env`, keep the app on `0.0.0.0:80` but add a second
+   publication by hand in `docker-compose.override.yml`:
+   ```yaml
+   services:
+     dashboard:
+       ports:
+         - "80:8050"
+         - "127.0.0.1:8050:8050"
+   ```
+   `docker compose up -d` — both now serve.
+2. Install nginx, render the config from
+   `deploy/nginx/phenology.conf.template`, and change its `listen 80;` to
+   `listen 8080;`. Reload, then exercise the app end to end through
+   `http://<IP>:8080/` — click a pixel, cycle every chart tab, change metric
+   and opacity — while watching `/var/log/nginx/phenology.error.log`. Dash
+   callback POSTs to `/_dash-update-component` are the traffic that matters.
+3. Only once that is clean: drop the `80:8050` publication, `docker compose
+   up -d`, set `listen 80;`, reload nginx.
+4. Remove the hand-written `ports:` block and re-run `bootstrap.sh` so the
+   generated override is authoritative again.
+
+Slower and fiddlier than adoption, and it leaves hand-edited state that the
+next bootstrap run overwrites — worth it only when downtime genuinely cannot
+be scheduled.
 
 ## Instance sizing
 
@@ -194,7 +221,11 @@ The log self-truncates at 10MB (keeping the last 5000 lines), since it writes
 
 ## Related documents
 
-- `CLAUDE.md` — incident write-up and the reasoning behind each gunicorn flag
-- `docs/nginx-deployment-plan.md` — phased, reversible plan for retrofitting
-  nginx onto the **existing** production instance without a rebuild. This
-  script is the greenfield path; that document is the migration path.
+- `CLAUDE.md` — the 2026-07-30 incident write-up, the reasoning behind each
+  gunicorn flag, and what to check if the hang ever recurs.
+
+The phased migration plan that preceded this kit (`docs/nginx-deployment-plan.md`)
+was executed on 2026-07-30 and removed — it carried a second copy of the nginx
+config, which would have drifted from `deploy/nginx/phenology.conf.template`.
+Its one unique technique, the staged 8080 cutover, is preserved above. Recover
+the original with `git log --diff-filter=D -- docs/nginx-deployment-plan.md`.
