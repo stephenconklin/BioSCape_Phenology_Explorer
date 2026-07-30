@@ -35,11 +35,22 @@ docker inspect $(docker ps -qf name=dashboard) --format '{{.RestartCount}}'
 | No hang for 2+ weeks | Thread bump alone sufficed. Still execute eventually — a bare Python process on the open internet is not a position to stay in — but unhurried. |
 | Hangs continue *and* `conns` stays low | **Diagnosis is wrong.** Stop. Capture `py-spy dump` against the baseline in `~/dashboard-watch/baseline-w*.txt` before changing anything else. |
 
-That last row matters. This plan assumes the starvation diagnosis, which is
-well-supported but not proven — the gap in the original evidence is that the
-elapsed time between the failed external `curl` and the healthy `docker stats`
-was never established, so a transient network-path fault was never fully
-excluded.
+**Update 2026-07-30, after execution:** the diagnosis was subsequently
+confirmed and this plan was executed via `deploy/bootstrap.sh` (adoption
+path). The health sampler caught six consecutive localhost probes timing out
+at the full 20s with zero bytes, 21:32–21:42Z, self-recovering afterwards —
+which excludes the network-path alternative noted below and establishes that
+the `docker stats` reading of 819MB/5GB at 0.03% CPU was taken *during* the
+hang. See the incident section of `CLAUDE.md`.
+
+The plan is retained as the reversible, staged migration path for any future
+instance that cannot tolerate the ~2-4 minutes of downtime that
+`bootstrap.sh` adoption incurs.
+
+The original caveat, now resolved: this plan assumed the starvation diagnosis,
+which was well-supported but not proven — the gap being that the elapsed time
+between the failed external `curl` and the healthy `docker stats` was never
+established, so a transient network-path fault could not be fully excluded.
 
 ---
 

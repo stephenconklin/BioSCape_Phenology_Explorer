@@ -199,6 +199,34 @@ the handshake into gunicorn's **listen backlog**, but no worker thread ever
 and the two look nothing alike once you know to separate "is the process
 alive" from "is the process serving."
 
+### Confirmation from the health sampler
+
+The sampler installed mid-investigation caught the tail of the same event
+**from localhost**, which removes the last alternative explanation:
+
+```
+2026-07-30T21:32:01Z  http=000 t=20.002823s
+2026-07-30T21:34:01Z  http=000 t=20.002729s
+   … six consecutive 2-minute samples …
+2026-07-30T21:42:01Z  http=000 t=20.002305s
+```
+
+Three conclusions:
+
+1. **Server-side, not network.** These probes never left the host, so a
+   transient network-path or security-group fault is excluded.
+2. **Self-recovering.** Unreachable for at least 12 minutes, then service
+   resumed with no intervention — consistent with connections timing out and
+   freeing slots; inconsistent with a crash, an OOM, or a true deadlock.
+3. **The `docker stats` reading was taken during the hang.** 819MB/5GB at
+   0.03% CPU was sampled *inside* this window, not after recovery. The process
+   was alive, idle, and not serving simultaneously — which is the whole
+   diagnosis in one line.
+
+Full-`--max-time` timeouts with zero bytes are the signature to look for.
+`t=` equal to the timeout means nothing was ever sent; a slow-but-working app
+returns a partial or late response instead.
+
 ### Root cause
 
 The concurrency budget was `--workers 2 --threads 2` = **4 in-flight requests
