@@ -44,6 +44,44 @@ substantially slower than an rsync.
 
 ---
 
+## Running this on an instance that is already deployed
+
+This script assumes a *fresh* instance. On a host already running the
+dashboard, `APP_DIR` **must** point at the existing checkout:
+
+```ini
+APP_DIR="/home/exouser/bioscape_phenology_explorer"   # the real path
+```
+
+Otherwise the script clones a second copy, starts a second container against
+the same data, and then fails at the nginx step because the original container
+still holds port 80. Bootstrap detects this and refuses — it compares the
+`com.docker.compose.project.working_dir` label of any running dashboard
+container against `APP_DIR` — but set the path correctly rather than relying
+on the guard.
+
+With `APP_DIR` pointed at the existing checkout, the script **adopts** the
+deployment: it pulls, rewrites the compose `.env` to bind loopback, recreates
+the container (which frees port 80), then installs nginx in front. Expect
+**~2-4 minutes of downtime** during the rebuild and cutover.
+
+Two prerequisites:
+
+- The checkout must have **no uncommitted changes** — the script stops if
+  `git status --porcelain` is non-empty, since `--ff-only` would otherwise
+  fail after the compose config had already been rewritten.
+- Port 80 must end up free before the nginx step. The recreate handles this
+  automatically; the script verifies it and stops with instructions if not.
+
+**Rollback:** set `APP_BIND=0.0.0.0:80` in `<APP_DIR>/.env`, run
+`docker compose --project-directory <APP_DIR> up -d`, then
+`sudo systemctl stop nginx`.
+
+If you would rather migrate in reversible stages with a validation gate at
+each step — staging nginx on port 8080 and testing it before touching port 80
+— use `docs/nginx-deployment-plan.md` instead. That plan exists specifically
+for the running production instance; this script is the greenfield path.
+
 ## Instance sizing
 
 Baseline is `m3.small` (2 vCPU, 6GB RAM, 20GB root), which is what production

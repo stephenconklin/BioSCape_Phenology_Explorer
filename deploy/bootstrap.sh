@@ -95,6 +95,44 @@ if [[ -n "$SERVER_NAME" && "$ENABLE_TLS" == "yes" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Existing deployment elsewhere on this host
+#
+# Without this guard, pointing APP_DIR at a path other than an already-deployed
+# checkout silently creates a SECOND compose project (the project name derives
+# from the directory name).  Two containers would then run concurrently against
+# the same data, and the nginx step would fail anyway because the original
+# container still holds port 80 — leaving a half-configured host.
+# ---------------------------------------------------------------------------
+if command -v docker >/dev/null 2>&1; then
+  step "Existing deployment check"
+  CONFLICT=""
+  for cid in $(docker ps -q --filter "label=com.docker.compose.service=dashboard" 2>/dev/null); do
+    wd=$(docker inspect "$cid" \
+         --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+    [[ -n "$wd" && "$wd" != "$APP_DIR" ]] && CONFLICT="$wd"
+  done
+  if [[ -n "$CONFLICT" ]]; then
+    die "A dashboard container is already running from a different checkout:
+
+           running from : $CONFLICT
+           APP_DIR      : $APP_DIR
+
+       Proceeding would start a second container against the same data, and
+       the nginx step would fail because the running one still holds port 80.
+
+       To ADOPT the existing deployment (recommended), set in deploy/deploy.env:
+           APP_DIR=\"$CONFLICT\"
+       and re-run. The container is then recreated in place on loopback, which
+       frees port 80 for nginx. Expect ~2-4 minutes of downtime during the
+       rebuild-and-cutover.
+
+       To migrate gradually with rollback at every step instead, follow
+       docs/nginx-deployment-plan.md and do not use this script."
+  fi
+  ok "no conflicting deployment"
+fi
+
+# ---------------------------------------------------------------------------
 # Data volume — verified, never created
 # ---------------------------------------------------------------------------
 step "Data volume: $DATA_ROOT"
@@ -200,6 +238,17 @@ fi
 # ---------------------------------------------------------------------------
 step "Application checkout: $APP_DIR"
 if [[ -d "$APP_DIR/.git" ]]; then
+  # Adopting an existing checkout: a dirty tree would break --ff-only midway,
+  # after the compose .env has already been rewritten. Fail before that.
+  if [[ -n "$(git -C "$APP_DIR" status --porcelain --untracked-files=no)" ]]; then
+    git -C "$APP_DIR" status --short
+    die "Uncommitted changes in $APP_DIR (shown above).
+
+       Commit, stash, or discard them, then re-run:
+         git -C $APP_DIR stash
+       Generated files (.env, docker-compose.override.yml) are gitignored and
+       will not appear here."
+  fi
   git -C "$APP_DIR" fetch --quiet origin "$REPO_BRANCH"
   git -C "$APP_DIR" checkout --quiet "$REPO_BRANCH"
   git -C "$APP_DIR" pull --quiet --ff-only origin "$REPO_BRANCH"
@@ -273,6 +322,26 @@ curl -fsS --max-time 15 http://127.0.0.1:8050/health >/dev/null \
 # nginx
 # ---------------------------------------------------------------------------
 step "nginx reverse proxy"
+
+# Port 80 must be free before installing nginx: the Debian package starts the
+# service in its postinst, and a bind failure there leaves dpkg half-configured
+# and needing manual repair. Check first and fail cleanly instead.
+if ss -tlnp 2>/dev/null | grep -q ':80 ' && ! ss -tlnp 2>/dev/null | grep ':80 ' | grep -q nginx; then
+  echo
+  ss -tlnp 2>/dev/null | grep ':80 ' || true
+  die "Port 80 is held by something other than nginx (shown above).
+
+       Most likely a container still published on 0.0.0.0:80. This script
+       binds the app to 127.0.0.1:8050 and gives port 80 to nginx, so the
+       old publication must go first:
+
+         grep -n APP_BIND $APP_DIR/.env      # should read 127.0.0.1:8050
+         docker compose --project-directory $APP_DIR up -d
+         sudo ss -tlnp | grep ':80 '         # expect no output
+
+       If a non-Docker service owns port 80, stop it before re-running."
+fi
+
 command -v nginx >/dev/null 2>&1 || { apt-get install -y -qq nginx >/dev/null; ok "nginx installed"; }
 
 rm -f /etc/nginx/sites-enabled/default
