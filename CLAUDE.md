@@ -159,10 +159,157 @@ leak fixes:
 | Unbounded Docker logs on a 20GB root disk | `docker-compose.yml`: `logging.options.max-size: 10m, max-file: 3` | Default `json-file` driver has no size limit; over months of uptime this can silently fill the root disk, which then breaks temp files / restarts and looks like "the app hung." |
 | `_resolve_basemap_array` cache (`app.py`) sized for a bigger box | `lru_cache(maxsize=16)` → `maxsize=6` | Each entry (z/lon/lat display arrays) is tens to ~100MB; each of the 2 gunicorn workers holds its own copy, so 16 entries × 2 workers risked real memory pressure on 6GB. |
 
-**Not yet done** (host-level, outside the repo — do if RAM pressure shows up):
-add a ~2GB swapfile on the host (`fallocate` + `mkswap` + `swapon` + `/etc/fstab`
-entry) as an OOM safety net; Docker containers get access to host swap by
-default unless `--memory-swap` is explicitly capped, which it isn't here.
+**Done since** (host-level, outside the repo): the ~2GB swapfile is in place
+(`swapon --show` → `/swapfile 2G`). As of 2026-07-30 it had never been touched
+(`0B` used), confirming the box is not under memory pressure.
+
+## Incident: intermittent unresponsiveness (2026-07-30)
+
+The dashboard became unreachable "every few days." Recording the diagnostic
+path because the conclusion is counter-intuitive and the evidence is easy to
+misread as a memory problem.
+
+### What the evidence ruled out
+
+After 6 days of uptime, at a moment when the app was unreachable from outside:
+
+| Measurement | Value | Rules out |
+|---|---|---|
+| `docker stats` | 819MB / 5GB, 0.03% CPU | Memory leak, runaway compute |
+| `.State.OOMKilled` / `.ExitCode` | `false` / `0` | OOM kill |
+| `.RestartCount` | `0` over 6 days | Crash loop |
+| `grep -c 'WORKER TIMEOUT\|SIGKILL'` on 7d of logs | `0` | Requests exceeding `--timeout 120` |
+| host `uptime` load | 0.07 | Host-level contention |
+| `swapon --show` | 2G, `0B` used | Memory pressure of any kind |
+
+So the process was healthy and idle while being unreachable. **Resource
+dashboards were the wrong place to look**, and would have stayed green through
+the entire outage.
+
+### The measurement that actually diagnosed it
+
+```
+curl: (28) timed out after 30002 ms with 0 bytes received
+connect=0.115343s   total=30.002387s
+```
+
+TCP connect succeeded in 115ms, then zero bytes for 30s. The kernel completed
+the handshake into gunicorn's **listen backlog**, but no worker thread ever
+`accept()`ed it. That is request-slot starvation, not resource exhaustion —
+and the two look nothing alike once you know to separate "is the process
+alive" from "is the process serving."
+
+### Root cause
+
+The concurrency budget was `--workers 2 --threads 2` = **4 in-flight requests
+total**, on a port 80 published directly to the public internet. Logs showed
+constant scanner traffic (`mstshash=zgrab`, raw SSH banners, a Mirai-style
+`wget … chmod 777` attempt). Every such connection holds a gthread slot for
+its duration. Compounding it, `engine="netcdf4"` (`datacube_io.py`) serializes
+all reads through the HDF5 global lock and basemap computes use
+`scheduler="synchronous"`, so genuine requests hold a slot far longer than
+their CPU time suggests.
+
+**Why the logs were silent:** the `gthread` worker heartbeats from its poller
+loop, not from its request threads. Blocked request threads therefore never
+trip `--timeout`, gunicorn never logs `WORKER TIMEOUT`, and a fully starved
+app is indistinguishable from an idle one in the log stream.
+
+### Mitigations applied (commit `cd4787a`)
+
+| Change | Effect |
+|---|---|
+| `Dockerfile`: `--threads 2` → `8` | 4 → 16 concurrent slots. These threads block on I/O, so the cost is stack memory, not CPU; 2 cores stay adequate. |
+| `app.py`: `/health` route | Deliberately does **no** data access. The failure mode is unresponsiveness, so a trivial handler is the correct probe; adding a data read would cause restart loops on unrelated data errors. |
+| `docker-compose.yml`: `healthcheck` | Detects alive-but-not-serving, which `restart: unless-stopped` can never catch because nothing exits. |
+| `docker-compose.yml`: `autoheal` sidecar | **Required** — plain Docker never acts on health status (only Swarm reschedules unhealthy containers). `restart:` reacts only to process exit. Without the sidecar the healthcheck just paints the container red. |
+| `docker-compose.yml`: `cap_add: SYS_PTRACE` | Lets `py-spy dump` attach during a live hang without recreating the container, which would destroy the evidence. |
+
+These raise the starvation threshold and cap any outage at ~3 minutes. They do
+**not** stop scanners from consuming worker slots — see below.
+
+### Diagnostic recipes worth keeping
+
+```bash
+C=$(docker ps -qf name=dashboard)
+
+# Worker PIDs — python:3.11-slim has no `ps`, so read /proc directly
+docker exec $C sh -c 'ls /proc | grep -E "^[0-9]+$"'   # PID 1 = master
+docker exec $C py-spy dump --pid <WORKER_PID>
+
+# Who is holding connections (run on the host, during a hang)
+sudo ss -tn state established '( sport = :80 )' | awk '{print $4}' | sort | uniq -c | sort -rn | head
+```
+
+Reading a `py-spy` dump: all threads blocked in socket `recv`/`read` → slow
+client / scanner starvation. Threads in `netCDF4`/HDF5 or dask → serialized
+data reads. Different causes, different fixes. Keep a healthy-state baseline
+dump for comparison.
+
+## Future deployment strategy
+
+### Put nginx in front — unambiguously correct
+
+Gunicorn is not designed to face the internet unbuffered; its own docs say so.
+A slow or malicious client talking directly to gunicorn occupies a worker slot
+for the whole conversation. nginx buffers the full request before handing it
+over, so slow clients consume an nginx connection (cheap, event-driven) rather
+than a Python thread (scarce). It also terminates TLS, serves `assets/`
+directly without waking Python, and drops malformed requests before they reach
+the app.
+
+The single highest-value line of the whole change:
+
+```yaml
+ports:
+  - "127.0.0.1:8050:8050"    # was "80:8050"
+```
+
+Binding to loopback removes gunicorn from the public internet entirely. Every
+scanner connection then terminates at nginx. This is worth doing even before
+nginx is fully configured.
+
+Target shape:
+
+```
+internet → nginx (host, :80/:443, TLS via certbot)
+         → 127.0.0.1:8050 → gunicorn container (unchanged)
+```
+
+Host nginx rather than a third container is the simpler choice here: certbot
+integration is turnkey, and there is only ever one app instance on this box.
+
+### Docker vs. bare-metal gunicorn — keep Docker
+
+Running gunicorn straight on the host under systemd is a reasonable
+architecture, but on this box it trades away more than it gains:
+
+| Concern | Docker (current) | Bare metal + systemd |
+|---|---|---|
+| Dependency reproducibility | Pinned in the image; rebuild is deterministic | Host venv drifts; the `dash-bootstrap-components 2.0.4` tab regression (see Known Display Issues) was *caused* by an unpinned range resolving differently between environments |
+| Memory cap | `mem_limit: 5g` | `MemoryMax=5G` in the unit file — equivalent, but easy to forget |
+| Log rotation | `json-file max-size` | journald with `SystemMaxUse=` — equivalent |
+| Read-only data mount | `/data:ro` enforced by the kernel | Filesystem permissions only |
+| Restart on hang | healthcheck + autoheal | `systemd` `Restart=` + a `WatchdogSec` or external probe |
+| Code change turnaround | Rebuild (~1 min) | `systemctl restart` (seconds) |
+| Disk cost | Images + build cache accumulate; needs periodic `docker builder prune` | None |
+
+The real friction with Docker here is rebuild latency and disk accumulation on
+a 20GB root, not correctness. Neither justifies giving up pinned dependencies
+on a box that has already been bitten once by dependency drift.
+
+**Recommendation: keep the container, bind it to loopback, add host nginx.**
+That fixes the actual exposure problem and leaves every existing safeguard
+(memory cap, log caps, read-only mount, healthcheck, autoheal) intact.
+
+### Housekeeping that is genuinely load-bearing
+
+The 20GB root disk hit 90% during this investigation. A full root breaks temp
+files and restarts, and presents as "the app hung" — a distinct failure with
+identical symptoms. `docker builder prune -af` reclaimed 1.4GB; note that
+`docker image prune -af` reclaims nothing while images are pinned by existing
+containers, even when `docker system df` reports them "100% reclaimable."
+Worth a periodic check of `journalctl --disk-usage` and `apt-get clean` too.
 
 ## Config Reference
 
