@@ -10,8 +10,47 @@ services:
       - /media/volume/Bioscape_Dashboard_Data/phenology_data:/data:ro
     restart: unless-stopped
     mem_limit: 5g
+    # Lets `py-spy dump` attach to the gunicorn workers from inside the
+    # container.  Costs nothing at runtime, and means a live hang can be
+    # inspected immediately — without it, enabling ptrace requires recreating
+    # the container, which destroys the very state worth capturing.
+    cap_add:
+      - SYS_PTRACE
+    # Detects the "alive but not serving" hang: the process never exits, so
+    # `restart: unless-stopped` alone can never catch it.  Uses urllib rather
+    # than curl/wget — neither is present in the python:3.11-slim base image.
+    # start_period covers the ~5s preload import of numpy/xarray/dask.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8050/health', timeout=10).status == 200 else 1)"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    labels:
+      autoheal: "true"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Docker does NOT act on healthcheck status on its own — `restart:` only
+  # reacts to process exit, and only Swarm reschedules unhealthy containers.
+  # This sidecar watches for health=unhealthy on autoheal-labelled containers
+  # and restarts them, turning a multi-hour outage into a ~3 minute one.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 30
+      AUTOHEAL_START_PERIOD: 120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

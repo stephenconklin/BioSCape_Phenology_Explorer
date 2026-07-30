@@ -247,6 +247,23 @@ app = Dash(
 server = app.server   # Dash Enterprise / gunicorn WSGI entry point
 
 
+@server.route("/health")
+def _health():
+    """Liveness probe for the Docker healthcheck.
+
+    Deliberately does no data access — no datacube open, no Dask compute.
+    The failure mode this exists to catch is request-slot starvation: the
+    process is alive and the socket accepts, but every gthread slot is held
+    (slow/scanner connections, or a long serialized netCDF read) so nothing
+    is serviced.  A trivial handler still cannot run when that happens, so
+    a plain 200 is a sufficient and specific signal.
+
+    Keep it dependency-free: adding a data read here would make the probe
+    fail for reasons unrelated to responsiveness and cause restart loops.
+    """
+    return "ok", 200, {"Cache-Control": "no-store"}
+
+
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
