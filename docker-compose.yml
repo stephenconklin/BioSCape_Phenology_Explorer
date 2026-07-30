@@ -2,8 +2,14 @@ services:
   dashboard:
     build: .
     image: bioscape-phenology-explorer:latest
+    # APP_BIND controls public exposure and is read from a `.env` file beside
+    # this compose file (gitignored).  Default preserves the pre-nginx layout
+    # so an existing deployment is unaffected by this parameterisation.
+    #   0.0.0.0:80      → published straight to the internet (legacy)
+    #   127.0.0.1:8050  → loopback only, reachable solely via host nginx
+    # deploy/bootstrap.sh writes the loopback form for fresh installs.
     ports:
-      - "80:8050"
+      - "${APP_BIND:-0.0.0.0:80}:8050"
     environment:
       VI_DATACUBE_ROOT: /data
     volumes:

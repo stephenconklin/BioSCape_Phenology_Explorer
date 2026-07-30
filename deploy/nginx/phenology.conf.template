@@ -1,0 +1,83 @@
+# BioSCape Phenology Explorer — nginx reverse proxy
+#
+# Rendered by deploy/bootstrap.sh (placeholders __SERVER_NAME__ substituted)
+# to /etc/nginx/sites-available/phenology.  Do not edit the installed copy —
+# edit this template and re-run bootstrap.sh, or the next run overwrites it.
+#
+# Purpose: gunicorn is not designed to face the internet unbuffered.  A slow
+# client talking to it directly holds one of its 16 threads for the whole
+# conversation; that is what caused the 2026-07-30 hangs (see CLAUDE.md).
+# nginx buffers each complete request before contacting the app, so a slow
+# client costs an event-driven nginx connection instead of a Python thread.
+
+# Rate limit keyed by client IP.  10r/s with a burst of 40 sits far above what
+# a human driving the dashboard generates (one page load is a burst of
+# callback POSTs, hence the generous burst) and far below a scanner sweep.
+limit_req_zone $binary_remote_addr zone=phen:10m rate=10r/s;
+
+# Per-IP connection cap — the direct defence against the slow-client
+# starvation this proxy exists to prevent.
+limit_conn_zone $binary_remote_addr zone=phenconn:10m;
+
+upstream phenology_app {
+    server 127.0.0.1:8050 fail_timeout=0s;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __SERVER_NAME__;
+
+    client_max_body_size 2m;      # no uploads; Dash callback POSTs are small
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+
+    # Buffer the full request before touching gunicorn. This is the point of
+    # the whole exercise — a slow client must never occupy a Python thread.
+    proxy_request_buffering on;
+    proxy_buffering on;
+    proxy_buffers 16 16k;
+    proxy_busy_buffers_size 64k;
+
+    # Must exceed gunicorn's --timeout 120, so a legitimately slow basemap
+    # compute is not severed by the proxy before the app itself gives up.
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 130s;
+    proxy_read_timeout 130s;
+
+    gzip on;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    # Dash callback responses are JSON and compress extremely well.
+    gzip_types application/json application/javascript text/css text/plain
+               image/svg+xml application/manifest+json;
+
+    access_log /var/log/nginx/phenology.access.log;
+    error_log  /var/log/nginx/phenology.error.log;
+
+    # Health probe — exempt from rate limiting and access logging, since the
+    # sampler cron hits it every 2 minutes.
+    location = /health {
+        access_log off;
+        proxy_pass http://phenology_app;
+        proxy_set_header Host $host;
+    }
+
+    location / {
+        limit_req zone=phen burst=40 nodelay;
+        limit_conn phenconn 24;
+
+        proxy_pass http://phenology_app;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Harmless over plain HTTP; needed if Dash dev-tools websockets are
+        # ever enabled.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}

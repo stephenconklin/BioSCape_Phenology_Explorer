@@ -53,3 +53,7 @@ gunicorn*.log
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Deployment — host-specific config, never commit
+deploy/deploy.env
+docker-compose.override.yml
