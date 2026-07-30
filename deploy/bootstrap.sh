@@ -137,7 +137,12 @@ fi
 # ---------------------------------------------------------------------------
 step "Data volume: $DATA_ROOT"
 
-if [[ ! -d "$DATA_ROOT" ]]; then
+# Escape hatch for layouts this check does not anticipate. The bind mount is
+# what actually matters; this check only exists to fail early rather than
+# after the app is up and broken.
+if [[ "${SKIP_DATA_CHECK:-0}" == "1" ]]; then
+  warn "SKIP_DATA_CHECK=1 — data verification bypassed"
+elif [[ ! -d "$DATA_ROOT" ]]; then
   die "Data directory not found: $DATA_ROOT
 
        The datacubes are not provisioned by this script. On a fresh instance:
@@ -147,21 +152,31 @@ if [[ ! -d "$DATA_ROOT" ]]; then
          4. Re-run this script.
 
        If the data lives elsewhere, set DATA_ROOT in deploy/deploy.env."
+else
+  # Search the full tree rather than assuming a layout — regions and variables
+  # may be nested arbitrarily deep. `-print -quit` stops at the first hit, so
+  # this stays fast on a 20GB+ volume.
+  DATA_HIT=$(find "$DATA_ROOT" \( -name '*.nc' -o -name '*.npz' -o -name '*.zarr' \) \
+             -print -quit 2>/dev/null || true)
+  if [[ -z "$DATA_HIT" ]]; then
+    echo
+    echo "    Top two levels of $DATA_ROOT:"
+    find "$DATA_ROOT" -maxdepth 2 2>/dev/null | head -20 | sed 's/^/      /'
+    die "No .nc / .npz / .zarr files found anywhere under $DATA_ROOT
+
+       Listing above. If the data is real but stored under different
+       extensions, set DATA_ROOT correctly in deploy/deploy.env, or bypass
+       this check entirely:
+         sudo SKIP_DATA_CHECK=1 ./deploy/bootstrap.sh"
+  fi
+  ok "data present (e.g. ${DATA_HIT#"$DATA_ROOT"/})"
 fi
 
-DATA_FILES=$(find "$DATA_ROOT" -maxdepth 2 \( -name '*.nc' -o -name '*.npz' -o -name '*.zarr' \) 2>/dev/null | wc -l)
-if [[ "$DATA_FILES" -eq 0 ]]; then
-  die "No .nc / .npz / .zarr files found under $DATA_ROOT
-
-       The directory exists but appears empty. The dashboard will start and
-       then fail on every interaction. Populate it before continuing."
+if [[ -d "$DATA_ROOT" ]]; then
+  mountpoint -q "$DATA_ROOT" 2>/dev/null \
+    || warn "$DATA_ROOT is not a mountpoint — data may be on the small root disk."
+  df -h "$DATA_ROOT" | awk 'NR==2 {printf "    ---  volume: %s used of %s (%s)\n", $3, $2, $5}'
 fi
-ok "$DATA_FILES data file(s) found"
-
-if ! mountpoint -q "$DATA_ROOT" 2>/dev/null; then
-  warn "$DATA_ROOT is not a mountpoint — data may be on the small root disk."
-fi
-df -h "$DATA_ROOT" | awk 'NR==2 {printf "    ---  volume: %s used of %s (%s)\n", $3, $2, $5}'
 
 # ---------------------------------------------------------------------------
 # --check mode stops here after reporting live state
