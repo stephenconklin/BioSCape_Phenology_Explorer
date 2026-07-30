@@ -173,8 +173,16 @@ else
 fi
 
 if [[ -d "$DATA_ROOT" ]]; then
-  mountpoint -q "$DATA_ROOT" 2>/dev/null \
-    || warn "$DATA_ROOT is not a mountpoint — data may be on the small root disk."
+  # The concern is data sitting on the small root filesystem, not whether
+  # DATA_ROOT is itself a mountpoint — it is normally a subdirectory of one
+  # (e.g. /media/volume/<vol>/phenology_data). Resolve the filesystem that
+  # actually backs the path instead of testing the leaf directory.
+  DATA_FS=$(findmnt -n -o TARGET --target "$DATA_ROOT" 2>/dev/null || echo "/")
+  if [[ "$DATA_FS" == "/" ]]; then
+    warn "$DATA_ROOT is on the root filesystem — expected an attached volume."
+  else
+    ok "backed by $DATA_FS"
+  fi
   df -h "$DATA_ROOT" | awk 'NR==2 {printf "    ---  volume: %s used of %s (%s)\n", $3, $2, $5}'
 fi
 
