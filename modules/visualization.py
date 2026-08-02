@@ -395,7 +395,7 @@ def make_empty_timeseries_figure() -> go.Figure:
     return go.Figure(
         layout=go.Layout(
             title=dict(
-                text="Click a pixel on the map to view its time series",
+                text="Select a region, then click a pixel on the map to view its time series",
                 font=dict(size=13, color="rgba(255,255,255,0.70)", family="'Space Mono', monospace"),
             ),
             xaxis=dict(visible=False),
