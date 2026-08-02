@@ -1,6 +1,6 @@
 # BioSCape Phenology Explorer
 
-An interactive web dashboard for exploring vegetation index (VI) phenology across the [BioSCape project's](https://bioscape.io) LVIS flight box regions. Built on Plotly Dash and Dash-Leaflet, and deployable to Plotly Cloud or any Gunicorn-compatible host.
+An interactive web dashboard for exploring vegetation index (VI) phenology across the [BioSCape](https://bioscape.io) project's LVIS flight box regions. Built on Plotly Dash and Dash-Leaflet, and deployable to Plotly Cloud or any Gunicorn-compatible host.
 
 [![BioSCape Phenology Explorer](docs/images/BioSCape-Phenology-Explorer-Dashboard.png)](docs/images/BioSCape-Phenology-Explorer-Dashboard.png)
 
