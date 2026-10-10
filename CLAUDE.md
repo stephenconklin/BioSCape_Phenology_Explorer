@@ -443,7 +443,7 @@ cache was 0B, container and nginx logs were small and rotating.
   no autoremove, journald uncapped (815M), apt archives (391M), a disabled
   Firefox snap revision plus a stalled `.snap.partial` (~0.7G).
 
-Recovered to 88% / 2.4G free with: `apt-get clean`, journald cap + vacuum,
+Recovered to 88% / 2.4G free (80% / 3.7G after the NVIDIA removal below) with: `apt-get clean`, journald cap + vacuum,
 removing disabled snap revisions, `dpkg --configure -a`, `apt-get autoremove
 --purge`. Grub was checked first — it still defaulted to a fully installed
 kernel, so a reboot during the incident would have been safe.
@@ -454,11 +454,21 @@ journald capped at 200M by `/etc/systemd/journald.conf.d/50-disk-cap.conf`.
 Automatic reboots are deliberately **off** (owner's choice) — reboot manually
 now and then so old kernels become removable.
 
-Not done, but available if space gets tight again: purge the NVIDIA driver
-(no GPU on `m3.small`; ~0.7-1GB and no more per-kernel DKMS builds), drop the
-6.8 GA kernel metapackages (`linux-image-virtual`, `linux-headers-virtual`,
-`linux-headers-generic`; halves kernel churn), or remove the desktop stack if
-the Exosphere web desktop is never used.
+**NVIDIA driver removed** (2026-10-10; no GPU on `m3.small`): purged
+`nvidia-linux-grid-535` (its prerm removes the DKMS builds) and the
+`nvidia-docker2` / `nvidia-container-toolkit` stack — freed 1.3GB, root now
+80%, and kernel updates no longer trigger a driver build. Safe because every
+container runs `runc` (the default); `/etc/docker/daemon.json` only *registered*
+an `nvidia` runtime. It was reset to `{}` (backup:
+`daemon.json.pre-nvidia-removal`) without restarting Docker, so the change
+applies at the next reboot. The Guacamole desktop is unaffected — it is
+TurboVNC/Xvnc with software rendering and never used the driver. Moving to a
+GPU flavor would need the driver reinstalled.
+
+Still available if space gets tight: drop the 6.8 GA kernel metapackages
+(`linux-image-virtual`, `linux-headers-virtual`, `linux-headers-generic`;
+halves kernel churn), or remove the desktop stack if the Exosphere web
+desktop is never used.
 
 ## Config Reference
 
