@@ -117,9 +117,12 @@ runs on. Two constraints are worth knowing before choosing smaller:
 - **RAM.** `mem_limit` defaults to `5g`, leaving ~1GB for the host. Below 6GB
   total, lower `MEM_LIMIT` in `deploy.env` — an uncapped container lets the
   *host* kernel pick an OOM victim, which could be sshd.
-- **Root disk.** 20GB is adequate but not generous; Docker images plus build
-  cache reach ~5GB and production has hit 90%. The script reclaims build cache
-  automatically when free space drops under 3GB.
+- **Root disk.** 20GB is tight: the Jetstream2 base image alone (desktop,
+  NVIDIA driver, two kernel lines) uses ~17.5GB, and production filled to 100%
+  on 2026-09-25 when an unattended kernel install ran out of room. The script
+  caps journald at 200M and installs a weekly cleanup (`housekeeping.sh`, Sun
+  03:30) that finishes half-configured packages, autoremoves old kernels, and
+  clears the apt cache, disabled snap revisions and unused Docker images/cache.
 
 ---
 
@@ -215,7 +218,19 @@ sudo tail -f /var/log/nginx/phenology.error.log
 ```
 
 The log self-truncates at 10MB (keeping the last 5000 lines), since it writes
-720 times a day onto a disk that has reached 90%.
+720 times a day onto a disk that has reached 100%. It also writes a
+`DISK WARNING` line once root passes 95%:
+
+```bash
+grep 'DISK WARNING' ~/dashboard-watch/health.log | tail
+cat /var/log/phenology-housekeeping.log          # weekly: freed / free / used%
+sudo /usr/local/sbin/phenology-housekeeping      # run the cleanup now
+```
+
+Kernels are not removed while they are running, and this host is not set to
+reboot automatically, so reboot occasionally (after `--check` shows
+`System restart required`, or `cat /var/run/reboot-required`) to let the
+weekly autoremove drop the old ones.
 
 ---
 

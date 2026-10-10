@@ -26,7 +26,7 @@ C=$(docker ps -qf name=dashboard 2>/dev/null)
 
   free -m | awk '/Mem:/{print "host_mem_used="$3"MB free="$4"MB"}'
   echo "swap_used=$(free -m | awk '/Swap:/{print $3}')MB"
-  df -h / | awk 'NR==2{print "root_disk="$5}'
+  df -h / | awk 'NR==2{print "root_disk="$5; if ($5+0 >= 95) print "DISK WARNING: root at "$5}'
 
   # The signal that separates request-slot starvation from everything else.
   echo "conns=$(ss -tn state established '( sport = :80 or sport = :443 )' 2>/dev/null | tail -n +2 | wc -l)"

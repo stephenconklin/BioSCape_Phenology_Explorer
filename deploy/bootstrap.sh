@@ -199,6 +199,9 @@ if [[ "$MODE" == "check" ]]; then
   fi
   echo "    ---  swap: $(swapon --show=SIZE --noheadings 2>/dev/null | tr '\n' ' ' || echo none)"
   echo "    ---  root disk: $(df -h / | awk 'NR==2{print $5" used, "$4" free"}')"
+  [[ -n "$(dpkg --audit 2>/dev/null)" ]] && warn "half-configured packages — run: sudo dpkg --configure -a"
+  [[ -f /etc/cron.d/phenology-housekeeping ]] && ok "housekeeping: $(tail -1 /var/log/phenology-housekeeping.log 2>/dev/null || echo 'installed, not yet run')" \
+    || warn "housekeeping cron NOT installed"
   probe=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 http://127.0.0.1/health 2>&1 || echo "unreachable")
   [[ "$probe" == "200" ]] && ok "http://127.0.0.1/health → 200" || warn "health probe → $probe"
   exit 0
@@ -254,6 +257,24 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
     ok "swap enabled and persisted in /etc/fstab"
   fi
+
+  # -------------------------------------------------------------------------
+  # The base image leaves ~1.3GB free on a 20GB root; on 2026-09-25 a single
+  # unattended kernel install filled it.  See deploy/housekeeping.sh.
+  step "Root-disk housekeeping"
+  install -d /etc/systemd/journald.conf.d
+  JOURNAL_CAP=/etc/systemd/journald.conf.d/50-disk-cap.conf
+  if [[ -f "$JOURNAL_CAP" ]]; then
+    skip "journald cap"
+  else
+    printf '[Journal]\nSystemMaxUse=200M\nSystemKeepFree=1G\n' > "$JOURNAL_CAP"
+    systemctl restart systemd-journald
+    ok "journald capped at 200M"
+  fi
+  install -m 0755 "$SCRIPT_DIR/housekeeping.sh" /usr/local/sbin/phenology-housekeeping
+  echo '30 3 * * 0 root /usr/local/sbin/phenology-housekeeping' \
+    > /etc/cron.d/phenology-housekeeping
+  ok "weekly cleanup (Sun 03:30) → /var/log/phenology-housekeeping.log"
 fi
 
 # ---------------------------------------------------------------------------
