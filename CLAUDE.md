@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # VI Phenology Plotly Cloud Dashboard — Claude Code Context
 
 ## Project Overview
@@ -11,6 +15,25 @@ instead of Shiny reactives, and dash-leaflet instead of ipyleaflet.
 ```bash
 python app.py                   # http://127.0.0.1:8050
 gunicorn app:server             # Dash Enterprise / gunicorn deployment
+docker compose up -d --build    # production (Jetstream2); see Deployment below
+```
+
+There is no test suite, linter config, or CI. Verify changes by running the app
+against real data.
+
+Data location is `config.DATACUBE_ROOT`, overridden by `VI_DATACUBE_ROOT` (local
+path or `gs://` URI). GCS auth: `GOOGLE_SERVICE_ACCOUNT_JSON` (key JSON content)
+and `GCS_TOKEN` (`anon` | `google_default`). With no data present the app still
+starts, but `discover_regions()` finds nothing and the region dropdown is empty.
+
+Offline data-prep CLIs (all accept `--region <ID>` or `--all`; read their
+module docstrings for the full flag list):
+
+```bash
+python tools/convert_to_zarr.py --region G5_14           # NC → Zarr v3 rechunk
+python tools/pixel_phenology_extract.py --region G5_14   # → <VI>_<region>_pixel_metrics.nc
+python tools/cache_basemaps.py --all [--force|--dry-run] # → <stem>_basemap_<metric>_d<max_dim>.npz
+python tools/densify_flightboxes.py                      # regenerate densified flight-box GeoJSON
 ```
 
 ## Key Files
@@ -25,15 +48,37 @@ gunicorn app:server             # Dash Enterprise / gunicorn deployment
 | `tools/pixel_phenology_extract.py` | Batch per-pixel metric extraction → `pixel_metrics.nc` |
 | `tools/convert_to_zarr.py` | One-time CLI: rechunk NC → Zarr |
 | `tools/cache_basemaps.py` | One-time CLI: pre-compute basemap `.npz` caches |
-| `shapefiles/` | LVIS_Flightboxes.geojson |
+| `tools/densify_flightboxes.py` | One-time CLI: segmentize flight-box edges in each region's UTM CRS so they follow the raster's curve in WGS84 |
+| `shapefiles/` | Overlays registered in `config.SHAPEFILE_LAYERS` — the app loads `LVIS_Flightboxes_densified.geojson` (selectable) and `BioSCape_HLS_Tiles.geojson` (non-interactive); `LVIS_Flightboxes.geojson` is the un-densified source |
+| `deploy/` | Host provisioning (nginx in front of the container) — see `deploy/README.md` |
 
 ## Architecture Notes
 
-### State management
+### Region discovery
+`discover_regions()` (`datacube_io.py`) scans `DATACUBE_ROOT` for `*.zarr` stores
+and `*.nc` datacubes (skipping any stem containing `pixel_metrics`), and parses
+stems like `NDVI_G5_1_datacube` → region `G5_1`, VI `NDVI`. Sidecar files are
+found next to the datacube by naming convention: `pixel_metrics.nc` (see below)
+and the `.npz` basemap caches. Datacube CRS is auto-detected per region — don't
+assume UTM 34S (`G5_17` is 35S).
+
+### Basemap: fast vs. precomputed metrics
+The metric dropdown has two groups. The four `FAST_BASEMAP_METRICS` (VI-scaled
+temporal reductions of the datacube) are loaded from `.npz` caches, falling back
+to a live Dask reduction. The 19 phenology metrics come from `pixel_metrics.nc`
+at `BASEMAP_MAX_DIM_PRECOMPUTED`. `_resolve_basemap_array` (`app.py`) picks the
+source and is `lru_cache`d per worker.
+
+### State management / callback chain
 - Shiny's `reactive.Value` / `reactive.Calc` → `dcc.Store` components.
-- Pixel result (Whittaker solve) is computed once in `compute_pixel_result` callback
-  and stored in `pixel-result-store`; all four chart callbacks read from that store
-  to avoid redundant computation.
+- Flow: `region-dropdown` → `dataset-info` → year slider; region/metric/style →
+  `update_basemap` (overlay PNG, colorbar, `basemap-info`); map click →
+  `update_selected_pixel` → `selected-pixel` → `compute_pixel_result` →
+  `pixel-result` → four chart callbacks + pixel info + metrics table.
+- The Whittaker solve runs once in `compute_pixel_result` and is stored in the
+  `pixel-result` store; all chart callbacks read from it to avoid redundant
+  computation. NaNs are serialized for JSON and restored with `_restore_nan` /
+  `_restore_annual_nan` on the read side.
 
 ### Colorscale limits — important caveat
 `_compute_colorscale_limits(z, sel, metric)` in `app.py` computes SD-clipped bounds.
@@ -55,9 +100,9 @@ values in different units and must never gate VI observations.  See `_FAST_METRI
 guard in `compute_pixel_result`.
 
 ### pixel_metrics.nc
-Same naming convention as Shiny: `{vi_var}_{region_id}_pixel_metrics.nc`.
-Same 19 metrics, same repair tool (`tools/repair_pixel_metrics.py` in the Shiny repo
-or an equivalent copy here).
+Same naming convention as Shiny: `{vi_var}_{region_id}_pixel_metrics.nc`
+(fallback: `<datacube_stem>_pixel_metrics.nc`). Same 19 metrics. The repair tool
+(`tools/repair_pixel_metrics.py`) lives only in the Shiny repo; there is no copy here.
 
 ### Font scaling system
 A-/A+ buttons in the sidebar header adjust a `--fs-scale` CSS custom property on
@@ -342,7 +387,7 @@ architecture, but on this box it trades away more than it gains:
 
 | Concern | Docker (current) | Bare metal + systemd |
 |---|---|---|
-| Dependency reproducibility | Pinned in the image; rebuild is deterministic | Host venv drifts; the `dash-bootstrap-components 2.0.4` tab regression (see Known Display Issues) was *caused* by an unpinned range resolving differently between environments |
+| Dependency reproducibility | Frozen in a built image — but `requirements.txt` uses open ranges (e.g. `dash-bootstrap-components>=1.5`), so a *rebuild* can still resolve newer versions | Host venv drifts; the `dash-bootstrap-components 2.0.4` tab regression (see Known Display Issues) was *caused* by an unpinned range resolving differently between environments |
 | Memory cap | `mem_limit: 5g` | `MemoryMax=5G` in the unit file — equivalent, but easy to forget |
 | Log rotation | `json-file max-size` | journald with `SystemMaxUse=` — equivalent |
 | Read-only data mount | `/data:ro` enforced by the kernel | Filesystem permissions only |
@@ -379,7 +424,41 @@ files and restarts, and presents as "the app hung" — a distinct failure with
 identical symptoms. `docker builder prune -af` reclaimed 1.4GB; note that
 `docker image prune -af` reclaims nothing while images are pinned by existing
 containers, even when `docker system df` reports them "100% reclaimable."
-Worth a periodic check of `journalctl --disk-usage` and `apt-get clean` too.
+
+## Incident: root disk full (2026-09-25 → 2026-10-10)
+
+Root hit 100% (1.5MB free); the app stayed healthy throughout because it only
+reads from the attached volume. **The app was not the cause** — Docker build
+cache was 0B, container and nginx logs were small and rotating.
+
+- **Baseline:** the Jetstream2 base image (GNOME, Firefox/mesa snaps, NVIDIA
+  driver + DKMS on a GPU-less flavor, both 6.8 GA and 7.0 HWE kernel lines)
+  sat at 93% — ~1.3GB free.
+- **Trigger:** unattended-upgrades installed kernel 7.0.0-34 on 2026-09-25
+  (sampler: 95% → 100% overnight). Each kernel is ~350-450MB of
+  image/modules/headers plus an NVIDIA DKMS build. The install died
+  half-configured (`dpkg --audit`: `iF linux-image-7.0.0-34-generic`), which
+  also blocks `apt-get autoremove`.
+- **Accumulators:** no reboot in 65 days (running kernel is never removed),
+  no autoremove, journald uncapped (815M), apt archives (391M), a disabled
+  Firefox snap revision plus a stalled `.snap.partial` (~0.7G).
+
+Recovered to 88% / 2.4G free with: `apt-get clean`, journald cap + vacuum,
+removing disabled snap revisions, `dpkg --configure -a`, `apt-get autoremove
+--purge`. Grub was checked first — it still defaulted to a fully installed
+kernel, so a reboot during the incident would have been safe.
+
+Prevention: [`deploy/housekeeping.sh`](deploy/housekeeping.sh) runs weekly
+from `/etc/cron.d/phenology-housekeeping` (installed by `bootstrap.sh`), with
+journald capped at 200M by `/etc/systemd/journald.conf.d/50-disk-cap.conf`.
+Automatic reboots are deliberately **off** (owner's choice) — reboot manually
+now and then so old kernels become removable.
+
+Not done, but available if space gets tight again: purge the NVIDIA driver
+(no GPU on `m3.small`; ~0.7-1GB and no more per-kernel DKMS builds), drop the
+6.8 GA kernel metapackages (`linux-image-virtual`, `linux-headers-virtual`,
+`linux-headers-generic`; halves kernel churn), or remove the desktop stack if
+the Exosphere web desktop is never used.
 
 ## Config Reference
 
